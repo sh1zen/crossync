@@ -1,0 +1,36 @@
+[package]
+name = "crossync"
+version = "0.0.1"
+authors = ["Andrea Frolli dev.sh1zen@outlook.it"]
+edition = "2024"
+description = "Rust Concurrent Programming Tools."
+license = "Apache-2.0"
+repository = "https://github.com/sh1zen/crossync"
+documentation = "https://docs.rs/crossync"
+readme = "README.md"
+keywords = ["no_std", "atomic", "thread-safe", "reference-counted", "fast"]
+categories = ["data-structures", "concurrency", "development-tools"]
+exclude = [".gitignore", ".github/*"]
+homepage = "https://github.com/sh1zen/crossync"
+
+[lib]
+name = "crossync"
+path = "src/lib.rs"
+
+[dependencies]
+crossbeam-utils = "0.8.21"
+
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bench]]
+name = "all"
+path = "benches/bench.rs"
+harness = false
+
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
+libc = "0.2.177"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_System_WindowsProgramming"] }
+
