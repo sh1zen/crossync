@@ -18,7 +18,6 @@
 pub mod atomic;
 pub mod channels;
 pub mod sync;
-pub mod utils;
 
 pub mod core;
 
