@@ -1,4 +1,4 @@
-use crate::sync::Mutex;
+use crate::sync::RawMutex;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -7,13 +7,13 @@ use std::ops::{Deref, DerefMut};
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct WatchGuardMut<'a, T: ?Sized> {
     data: *mut T,
-    lock: Mutex,
+    lock: RawMutex,
     marker: PhantomData<&'a mut T>,
 }
 
 impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
-    pub fn new(ptr: *mut T, lock: Mutex) -> WatchGuardMut<'mutex, T> {
+    pub(crate) fn new(ptr: *mut T, lock: RawMutex) -> WatchGuardMut<'mutex, T> {
         Self {
             data: ptr,
             lock,

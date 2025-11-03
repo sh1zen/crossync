@@ -67,20 +67,20 @@ impl InnerMutex {
 
 /// Public sync interface
 #[repr(transparent)]
-pub struct Mutex {
+pub(crate) struct RawMutex {
     ptr: *const InnerMutex,
 }
 
 // The sync can be safely sent across threads and shared concurrently
-unsafe impl Send for Mutex {}
-unsafe impl Sync for Mutex {}
+unsafe impl Send for RawMutex {}
+unsafe impl Sync for RawMutex {}
 
-impl std::panic::UnwindSafe for Mutex {}
-impl std::panic::RefUnwindSafe for Mutex {}
+impl std::panic::UnwindSafe for RawMutex {}
+impl std::panic::RefUnwindSafe for RawMutex {}
 
-impl Mutex {
+impl RawMutex {
     /// Creates a new `Mutex` instance (initial ref_count = 1)
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let ptr = Box::into_raw(Box::new(InnerMutex::new()));
         Self { ptr }
     }
@@ -92,36 +92,36 @@ impl Mutex {
     }
 
     /// Returns the current reference count
-    pub fn get_ref_count(&self) -> usize {
+    pub(crate) fn get_ref_count(&self) -> usize {
         self.inner().ref_count.load(Ordering::Acquire)
     }
 
     /// Returns the number of active shared locks (readers)
-    pub fn get_shared_locked(&self) -> usize {
+    pub(crate) fn get_shared_locked(&self) -> usize {
         readers_count(self.inner().state.load(Ordering::Acquire))
     }
 
     /// Returns true if the sync is locked in exclusive (writer) mode
     #[inline]
-    pub fn is_locked_exclusive(&self) -> bool {
+    pub(crate) fn is_locked_exclusive(&self) -> bool {
         is_writer_locked(self.inner().state.load(Ordering::Acquire))
     }
 
     /// Returns true if there are active readers holding the lock
     #[inline]
-    pub fn is_locked_shared(&self) -> bool {
+    pub(crate) fn is_locked_shared(&self) -> bool {
         let s = self.inner().state.load(Ordering::Acquire);
         !is_writer_locked(s) && readers_count(s) > 0
     }
 
     /// Returns true if the sync is locked in any mode
-    pub fn is_locked(&self) -> bool {
+    pub(crate) fn is_locked(&self) -> bool {
         self.inner().state.load(Ordering::Acquire) != UNLOCKED
     }
 
     /// Attempts to acquire an exclusive (writer) lock without blocking
     #[inline]
-    pub fn try_lock_exclusive(&self) -> bool {
+    pub(crate) fn try_lock_exclusive(&self) -> bool {
         self.inner()
             .state
             .compare_exchange(UNLOCKED, ONE_WRITER, Ordering::Acquire, Ordering::Relaxed)
@@ -129,7 +129,7 @@ impl Mutex {
     }
 
     /// Acquires the exclusive (writer) lock, blocking if necessary
-    pub fn lock_exclusive(&self) {
+    pub(crate) fn lock_exclusive(&self) {
         if self
             .inner()
             .state
@@ -141,7 +141,7 @@ impl Mutex {
     }
 
     /// Releases the exclusive lock. Wakes waiting threads if necessary.
-    pub fn unlock_exclusive(&self) {
+    pub(crate) fn unlock_exclusive(&self) {
         if self
             .inner()
             .state
@@ -230,7 +230,7 @@ impl Mutex {
 
     /// Attempts to acquire a shared (reader) lock without blocking
     #[inline]
-    pub fn try_lock_shared(&self) -> bool {
+    pub(crate) fn try_lock_shared(&self) -> bool {
         self.try_lock_shared_fast() || self.try_lock_shared_slow()
     }
 
@@ -278,14 +278,14 @@ impl Mutex {
     }
 
     /// Acquires a shared (reader) lock, blocking if necessary
-    pub fn lock_shared(&self) {
+    pub(crate) fn lock_shared(&self) {
         if !self.try_lock_shared_fast() {
             self.lock_shared_slow();
         }
     }
 
     /// Releases a shared (reader) lock
-    pub fn unlock_shared(&self) {
+    pub(crate) fn unlock_shared(&self) {
         let inner = self.inner();
         let prev_state = inner.state.fetch_sub(ONE_READER, Ordering::Release);
 
@@ -367,7 +367,7 @@ impl Mutex {
     }
 
     /// Releases all held shared locks at once (bulk reader release)
-    pub fn unlock_all_shared(&self) {
+    pub(crate) fn unlock_all_shared(&self) {
         let inner = self.inner();
 
         loop {
@@ -404,7 +404,7 @@ impl Mutex {
     }
 
     /// Downgrades a writer lock to a reader lock without releasing ownership
-    pub fn downgrade(&self) {
+    pub(crate) fn downgrade(&self) {
         let inner = self.inner();
         let mut state = inner.state.load(Ordering::Relaxed);
 
@@ -429,15 +429,15 @@ impl Mutex {
 }
 
 // Clone increases the internal reference count
-impl Clone for Mutex {
+impl Clone for RawMutex {
     fn clone(&self) -> Self {
         self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
-        Mutex { ptr: self.ptr }
+        RawMutex { ptr: self.ptr }
     }
 }
 
 // Drop decreases the reference count and deallocates if this is the last owner
-impl Drop for Mutex {
+impl Drop for RawMutex {
     fn drop(&mut self) {
         if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
@@ -448,14 +448,14 @@ impl Drop for Mutex {
 }
 
 // Support for Mutex::default()
-impl Default for Mutex {
+impl Default for RawMutex {
     fn default() -> Self {
         Self::new()
     }
 }
 
 // Implements Debug formatting for inspecting internal state
-impl fmt::Debug for Mutex {
+impl fmt::Debug for RawMutex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.inner().state.load(Ordering::Acquire);
         let readers = readers_count(state);

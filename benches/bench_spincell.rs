@@ -1,8 +1,8 @@
-use crossync::core::SpinCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
+use crossync::lock_free::SpinCell;
 
 fn benchmark_spinlockcell(
     n_threads: usize,

@@ -1,4 +1,4 @@
-use crate::sync::{Backoff, Mutex, WatchGuardMut, WatchGuardRef};
+use crate::sync::{Backoff, RawMutex, WatchGuardMut, WatchGuardRef};
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -19,7 +19,7 @@ const READ: usize = 2;
 struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
     state: AtomicUsize,
-    lock: Mutex,
+    lock: RawMutex,
 }
 
 impl<T> Slot<T> {
@@ -28,7 +28,7 @@ impl<T> Slot<T> {
         Self {
             value: UnsafeCell::new(MaybeUninit::uninit()),
             state: AtomicUsize::new(EMPTY),
-            lock: Mutex::new(),
+            lock: RawMutex::new(),
         }
     }
 
@@ -493,7 +493,6 @@ impl<T> FromIterator<T> for AtomicArray<T> {
 }
 
 impl<T> Default for AtomicArray<T> {
-
     fn default() -> Self {
         Self::new()
     }

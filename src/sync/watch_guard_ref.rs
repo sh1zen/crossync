@@ -1,4 +1,4 @@
-use crate::sync::Mutex;
+use crate::sync::RawMutex;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -7,13 +7,13 @@ use std::ops::Deref;
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct WatchGuardRef<'a, T: ?Sized> {
     data: *const T,
-    lock: Mutex,
+    lock: RawMutex,
     marker: PhantomData<&'a T>,
 }
 
 impl<'mutex, T: ?Sized> WatchGuardRef<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
-    pub fn new(ptr: &'mutex T, lock: Mutex) -> WatchGuardRef<'mutex, T> {
+    pub(crate) fn new(ptr: &'mutex T, lock: RawMutex) -> WatchGuardRef<'mutex, T> {
         Self {
             data: ptr,
             lock,

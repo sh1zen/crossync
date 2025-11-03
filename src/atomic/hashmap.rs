@@ -1,5 +1,5 @@
-use crate::core::RwLock;
-use crate::sync::{Mutex, WatchGuardMut, WatchGuardRef};
+use crate::sync::RwLock;
+use crate::sync::{RawMutex, WatchGuardMut, WatchGuardRef};
 use crossbeam_utils::CachePadded;
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
@@ -35,14 +35,14 @@ impl<K, V> Entry<K, V> {
 /// A slot in the bucket array
 struct Slot<K, V> {
     head: AtomicPtr<Entry<K, V>>,
-    mutex: Mutex,
+    mutex: RawMutex,
 }
 
 impl<K, V> Slot<K, V> {
     fn new() -> Self {
         Self {
             head: AtomicPtr::new(null_mut()),
-            mutex: Mutex::new(),
+            mutex: RawMutex::new(),
         }
     }
 }

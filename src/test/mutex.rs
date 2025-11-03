@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests_mutex {
-    use crate::sync::Mutex;
+    use crate::sync::RawMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -8,7 +8,7 @@ mod tests_mutex {
 
     #[test]
     pub(crate) fn kiko() {
-        let m = Mutex::new();
+        let m = RawMutex::new();
 
         m.lock_exclusive();
 
@@ -45,7 +45,7 @@ mod tests_mutex {
     pub(crate) fn stress_test() {
         let mut handles = vec![];
 
-        let mutex = Mutex::new();
+        let mutex = RawMutex::new();
 
         mutex.lock_exclusive();
 
@@ -69,12 +69,12 @@ mod tests_mutex {
 
     #[test]
     pub(crate) fn test_mutex() {
-        use crate::sync::Mutex;
+        use crate::sync::RawMutex;
         use std::thread;
         use std::thread::sleep;
         use std::time::Duration;
 
-        let mutex = Mutex::new();
+        let mutex = RawMutex::new();
 
         let m1 = mutex.clone();
         let m2 = mutex.clone();
@@ -105,7 +105,7 @@ mod tests_mutex {
 
     #[test]
     pub(crate) fn is_locked_reflects_state() {
-        let m = Mutex::new();
+        let m = RawMutex::new();
         assert!(!m.is_locked_exclusive());
         {
             let _g = m.lock_exclusive();
@@ -117,7 +117,7 @@ mod tests_mutex {
 
     #[test]
     pub(crate) fn exclusive_blocks_others() {
-        let m = Mutex::new();
+        let m = RawMutex::new();
 
         let entered_group = Arc::new(AtomicBool::new(false));
         let entered_excl = Arc::new(AtomicBool::new(false));
@@ -154,7 +154,7 @@ mod tests_mutex {
 
     #[test]
     pub(crate) fn group_allows_concurrency() {
-        let m = Mutex::new();
+        let m = RawMutex::new();
         const N: usize = 6;
 
         let barrier = Arc::new(Barrier::new(N));
@@ -186,7 +186,7 @@ mod tests_mutex {
 
     #[test]
     pub(crate) fn exclusives_are_mutually_exclusive() {
-        let m = Mutex::new();
+        let m = RawMutex::new();
         let inside = Arc::new(AtomicBool::new(false));
         let ok = Arc::new(AtomicBool::new(true));
 
@@ -216,7 +216,7 @@ mod tests_mutex {
 
     #[test]
     pub(crate) fn group_batch_then_exclusive() {
-        let m = Mutex::new();
+        let m = RawMutex::new();
         const G: usize = 4;
         let barrier_in = Arc::new(Barrier::new(G));
         let barrier_out = Arc::new(Barrier::new(G));
@@ -254,7 +254,7 @@ mod tests_mutex {
 
     #[test]
     pub(crate) fn stress_multi_lock() {
-        let m = Mutex::new();
+        let m = RawMutex::new();
 
         let mut ths = Vec::new();
         for id in 0..8 {

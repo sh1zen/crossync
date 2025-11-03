@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicUsize;
 
-pub type Futex = AtomicUsize;
+pub(crate)  type Futex = AtomicUsize;
 
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -22,21 +22,21 @@ mod platform;
 /// If atomic and value matches, wait until woken up.
 /// This function might also return spuriously. Handle that case.
 #[inline]
-pub fn futex_wait(atomic: &AtomicUsize, value: usize) {
+pub(crate) fn futex_wait(atomic: &AtomicUsize, value: usize) {
     platform::wait(atomic, value)
 }
 
 /// Wake one thread that is waiting on this atomic.
 /// It's okay if the pointer dangles or is null.
 #[inline]
-pub fn futex_wake(atomic: *const AtomicUsize) {
+pub(crate)  fn futex_wake(atomic: *const AtomicUsize) {
     platform::wake_one(atomic);
 }
 
 /// Wake all threads that are waiting on this atomic.
 /// It's okay if the pointer dangles or is null.
 #[inline]
-pub fn futex_wake_all(atomic: *const AtomicUsize) {
+pub(crate)  fn futex_wake_all(atomic: *const AtomicUsize) {
     platform::wake_all(atomic);
 }
 

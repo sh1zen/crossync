@@ -21,5 +21,8 @@ pub mod sync;
 
 pub mod core;
 
+pub mod lock_free;
+
 #[cfg(test)]
 mod test;
+

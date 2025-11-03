@@ -1,4 +1,4 @@
-use crate::sync::{Mutex, WatchGuardMut, WatchGuardRef};
+use crate::sync::{RawMutex, WatchGuardMut, WatchGuardRef};
 use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
 use std::panic::{RefUnwindSafe, UnwindSafe};
@@ -12,7 +12,7 @@ struct Inner<T> {
     /// Value stored in the cell, possibly uninitialized
     val: UnsafeCell<MaybeUninit<T>>,
     /// Mutex protecting concurrent access
-    state: Mutex,
+    state: RawMutex,
     /// Reference count for clone/drop semantics
     ref_count: CachePadded<AtomicUsize>,
 }
@@ -22,7 +22,7 @@ impl<T> Inner<T> {
     fn new(val: T) -> Self {
         Self {
             val: UnsafeCell::new(MaybeUninit::new(val)),
-            state: Mutex::new(),
+            state: RawMutex::new(),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
         }
     }

@@ -2,7 +2,7 @@
 
 - 🪪 Thread-safe with spin-lock backoff and kernel-level mutexes
 - ⚡ Optimized for high-concurrency workloads
-- 💾 Safe memory management via reference counting to optimize cloning
+- 💾 Optimized cloning with safe memory management via internal reference counting 
 - 🔐 Internal mutability
 
 ---
@@ -15,7 +15,6 @@ It uses block-based allocation, atomic indices, and internal backoff strategies 
 - 🧠 Suitable for implementing queues, stacks, and other dynamic collections
 - 🛡️ Shared/exclusive locking for safe access and reset operations
 - ♻️ Automatic block recycling and free-list management
-- 🔗 Cloneable: reference-counted clones share underlying storage
 - 📦 Can convert to standard Vec<T> safely, consuming elements
 
 ### Example
@@ -47,11 +46,11 @@ assert!(b.pop().is_none());
 
 ## ✨ AtomicHashMap
 
-**AtomicHashMap** is a thread-safe, concurrent hash map that supports high-performance insertion, retrieval, and removal of key-value pairs.  
+**AtomicHashMap** a blazingly fast thread-safe, concurrent hash map that supports high-performance insertion, retrieval, and removal of key-value pairs.  
 It uses fine-grained atomic operations combined with internal mutexes to manage contention efficiently.
 
-- 🧠 Ideal for shared caches, state maps, and runtime-managed data
-- 📏 Resizable bucket array to optimize hash distribution and performance
+- 🧠 Ideal for shared caches, state maps, and in high concurrency scenario
+- 📏 It uses resizable bucket array to optimize hash distribution and performance
 
 ### Example
 
@@ -106,13 +105,13 @@ let producer = {
 let consumer = {
     let buffer = buffer.clone();
     thread::spawn(move || {
-        if let Some(ptr) = buffer.pop() {
-            let val = unsafe { *Box::from_raw(ptr) };
-            assert_eq!(val, 1);
-        }
-        if let Some(ptr) = buffer.pop() {
-            let val = unsafe { *Box::from_raw(ptr) };
-            assert_eq!(val, 2);
+        let mut count = 1;
+        while count <= 2 {
+            if let Some(ptr) = buffer.pop() {
+                let val = unsafe { *Box::from_raw(ptr) };
+                assert_eq!(val, count);
+                count += 1;
+            }
         }
     })
 };
@@ -228,36 +227,36 @@ assert_eq!(result.age, 31);
 
 ---
 
-## ✨ Mutex — Fast Raw Locking
+## ✨ RwLock
 
-**Mutex** is a high-performance user-space mutex supporting exclusive and group locks.  
-Built on atomic primitives and exponential backoff, it minimizes kernel-level contention while providing safe multithreaded access control.
+**RwLock** is a lightweight, synchronization primitive for safe concurrent access. It provides multi-reader / single-writer locking with minimal kernel interaction.
 
-- 🧠 Suitable for multi-reader / single-writer synchronization in performance-critical systems
+ - ⚡ Fast atomic + futex-based design
+ - 🔒 Shared (read) and exclusive (write) modes
+ - 🧩 Clonable via internal ref-count (no data copy)
+ - ✅ Compared to std::RwLock: user-space (faster, no poisoning, clonable).
 
 ### Example
 
 ```rust
-use crossync::sync::Mutex;
+use crossync::sync::RwLock;
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
-let mutex = Mutex::new();
+let mutex = RwLock::new(5);
 
 let m1 = mutex.clone();
 
 let h1 = thread::spawn(move || {
-    m1.lock_exclusive();
-    sleep(Duration::from_millis(10));
-    m1.unlock_exclusive();
+let _guard = m1.lock();
+sleep(Duration::from_millis(10));
 });
 
 let m2 = mutex.clone();
 let h2 = thread::spawn(move || {
-    m2.lock_shared();
-    sleep(Duration::from_millis(10));
-    m2.unlock_shared();
+let _guard = m2.lock_shared();
+sleep(Duration::from_millis(10));
 });
 
 h1.join().unwrap();
@@ -306,7 +305,7 @@ Open your `Cargo.toml` and add:
 
 ```toml
 [dependencies]
-crossync = "0.0.1" # or the latest version available
+crossync = "0.0.2" # or the latest version available
 ```
 
 ---
