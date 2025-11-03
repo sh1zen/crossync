@@ -1,4 +1,5 @@
 use crate::sync::RawMutex;
+use std::any::{Any, TypeId};
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -10,6 +11,9 @@ pub struct WatchGuardRef<'a, T: ?Sized> {
     lock: RawMutex,
     marker: PhantomData<&'a T>,
 }
+
+unsafe impl<T: ?Sized + Sync> Sync for WatchGuardRef<'_, T> {}
+unsafe impl<T: ?Sized + Send> Send for WatchGuardRef<'_, T> {}
 
 impl<'mutex, T: ?Sized> WatchGuardRef<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
@@ -26,9 +30,54 @@ impl<'mutex, T: ?Sized> WatchGuardRef<'mutex, T> {
     }
 }
 
-/// `T` must be `Sync` for a [`WatchGuard<T>`] to be `Sync`
-/// because it is possible to get a `&T` from `&WatchGuard` (via `Deref`).
-unsafe impl<T: ?Sized + Sync> Sync for WatchGuardRef<'_, T> {}
+impl<'mutex, T: Sized> WatchGuardRef<'mutex, T> {
+    /// Attempts to downcast the inner value to a specific type `U`.
+    ///
+    /// # Safety
+    /// This function is **highly unsafe** and should only be used under very specific circumstances:
+    /// 1. The `WatchGuard` must have been constructed over a `Box::new(pointer)` stored as `Box<dyn Any>`.
+    /// 2. The type stored inside the `Box` must actually match the requested type `U`.
+    /// 3. Violating these assumptions can lead to undefined behavior, including invalid memory access or data corruption.
+    ///
+    /// # Usage Notes
+    /// - This is **not a general-purpose downcast**. It only works when the inner data is a `Box<dyn Any>`
+    ///   because it relies on raw pointer dereferencing to access the inner value.
+    /// - `downcast_ref` returns `Some(WatchGuardRef<'mutex, U>)` if the type matches, otherwise `None`.
+    /// - The caller must ensure that the original `Box<dyn Any>` is valid for the lifetime `'mutex`.
+    /// - Cloning of the internal lock is done to maintain guard semantics safely.
+    ///
+    /// # Usage case
+    /// - To decapsulate an internal value stored as `Box<dyn Any>` and access it as a concrete type.
+    /// - Safely preserves lock/guard semantics while exposing the inner value.
+    pub unsafe fn downcast_ref<U: Any>(&self) -> Option<WatchGuardRef<'mutex, U>>
+    where
+        T: Any + 'mutex,
+        U: Any + 'mutex,
+    {
+        // First, check if the stored type is a pointer to Box<dyn Any>.
+        // This ensures that we are only attempting a downcast if the inner value is a Box<dyn Any>.
+        if TypeId::of::<*const Box<dyn Any>>() != self.data.type_id() {
+            return None;
+        }
+        // SAFETY: At this point, we assume that `self.data` is actually a `*const Box<dyn Any>`.
+        // Dereferencing a raw pointer is unsafe, so the caller must guarantee the invariant:
+        // The underlying data was originally created as `Box<dyn Any>`.
+        let data = self.data as *const Box<dyn Any>;
+
+        // SAFETY: Now we dereference the Box to access the inner value.
+        // This is critically unsafe and works only if `data` truly points to a valid `Box<dyn Any>`.
+        let data = unsafe { &**data };
+
+        if TypeId::of::<U>() == data.type_id() {
+            // SAFETY: We are casting from `dyn Any` to `U`.
+            // Safe only because we just checked that the type IDs match.
+            let data = unsafe { &*(data as *const dyn Any as *const U) };
+            Some(WatchGuardRef::new(data, self.lock.clone()))
+        } else {
+            None
+        }
+    }
+}
 
 impl<T: ?Sized> Deref for WatchGuardRef<'_, T> {
     type Target = T;
@@ -61,5 +110,21 @@ impl<'a, T: Debug> Debug for WatchGuardRef<'a, T> {
             .field("data", &self.data)
             .field("lock", &self.lock)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests_watch_guard_ref {
+    use super::*;
+    use crate::sync::RwLock;
+    #[test]
+    fn test_cast() {
+        let lock = RwLock::new(Box::new(String::from("hello")) as Box<dyn Any>);
+        let guard = lock.lock_shared();
+
+        unsafe {
+            let t_str = guard.downcast_ref::<String>().unwrap();
+            assert_eq!(t_str, "hello");
+        }
     }
 }

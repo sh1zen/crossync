@@ -305,7 +305,7 @@ Open your `Cargo.toml` and add:
 
 ```toml
 [dependencies]
-crossync = "0.0.2" # or the latest version available
+crossync = "0.0.3" # or the latest version available
 ```
 
 ---
