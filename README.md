@@ -249,7 +249,7 @@ let mutex = RwLock::new(5);
 let m1 = mutex.clone();
 
 let h1 = thread::spawn(move || {
-let _guard = m1.lock();
+let _guard = m1.lock_exclusive();
 sleep(Duration::from_millis(10));
 });
 
@@ -305,7 +305,7 @@ Open your `Cargo.toml` and add:
 
 ```toml
 [dependencies]
-crossync = "0.0.3" # or the latest version available
+crossync = "0.0.4" # or the latest version available
 ```
 
 ---

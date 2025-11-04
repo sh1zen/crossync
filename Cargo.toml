@@ -1,6 +1,6 @@
 [package]
 name = "crossync"
-version = "0.0.3"
+version = "0.0.4"
 authors = ["Andrea Frolli dev.sh1zen@outlook.it"]
 edition = "2024"
 description = "Rust Concurrent Programming Tools."
@@ -8,8 +8,8 @@ license = "Apache-2.0"
 repository = "https://github.com/sh1zen/crossync"
 documentation = "https://docs.rs/crossync"
 readme = "README.md"
-keywords = ["no_std", "atomic", "thread-safe", "reference-counted", "fast"]
-categories = ["data-structures", "concurrency", "development-tools"]
+keywords = ["atomic", "thread-safe", "concurrent", "no_std", "mutex"]
+categories = ["data-structures", "concurrency", "development-tools", "algorithms"]
 exclude = [".gitignore", ".github/*"]
 homepage = "https://github.com/sh1zen/crossync"
 

@@ -2,7 +2,9 @@ use crate::sync::RawMutex;
 use std::any::{Any, TypeId};
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
+use std::ptr;
 
 /// used as wrapper for a pointer to a reference
 #[must_use = "if unused the Mutex will immediately unlock"]
@@ -49,32 +51,40 @@ impl<'mutex, T: Sized> WatchGuardRef<'mutex, T> {
     /// # Usage case
     /// - To decapsulate an internal value stored as `Box<dyn Any>` and access it as a concrete type.
     /// - Safely preserves lock/guard semantics while exposing the inner value.
-    pub unsafe fn downcast_ref<U: Any>(&self) -> Option<WatchGuardRef<'mutex, U>>
+    pub unsafe fn downcast<U: Any>(
+        this: WatchGuardRef<'mutex, T>,
+    ) -> Result<WatchGuardRef<'mutex, U>, WatchGuardRef<'mutex, T>>
     where
         T: Any + 'mutex,
         U: Any + 'mutex,
     {
+        let this = ManuallyDrop::new(this);
         // First, check if the stored type is a pointer to Box<dyn Any>.
         // This ensures that we are only attempting a downcast if the inner value is a Box<dyn Any>.
-        if TypeId::of::<*const Box<dyn Any>>() != self.data.type_id() {
-            return None;
+        if TypeId::of::<*const Box<dyn Any>>() != this.data.type_id() {
+            return Err(ManuallyDrop::into_inner(this));
         }
         // SAFETY: At this point, we assume that `self.data` is actually a `*const Box<dyn Any>`.
         // Dereferencing a raw pointer is unsafe, so the caller must guarantee the invariant:
         // The underlying data was originally created as `Box<dyn Any>`.
-        let data = self.data as *const Box<dyn Any>;
+        let data = this.data as *const Box<dyn Any>;
 
         // SAFETY: Now we dereference the Box to access the inner value.
         // This is critically unsafe and works only if `data` truly points to a valid `Box<dyn Any>`.
         let data = unsafe { &**data };
 
         if TypeId::of::<U>() == data.type_id() {
+            // Move the lock out of the ManuallyDrop (so we don't leak/unlock twice).
+            // This performs a bitwise move of `this.lock`.
+            let lock = unsafe { ptr::read(&this.lock) };
+
             // SAFETY: We are casting from `dyn Any` to `U`.
             // Safe only because we just checked that the type IDs match.
             let data = unsafe { &*(data as *const dyn Any as *const U) };
-            Some(WatchGuardRef::new(data, self.lock.clone()))
+
+            Ok(WatchGuardRef::new(data, lock))
         } else {
-            None
+            Err(ManuallyDrop::into_inner(this))
         }
     }
 }
@@ -120,10 +130,16 @@ mod tests_watch_guard_ref {
     #[test]
     fn test_cast() {
         let lock = RwLock::new(Box::new(String::from("hello")) as Box<dyn Any>);
-        let guard = lock.lock_shared();
 
+        let guard = lock.lock_shared();
         unsafe {
-            let t_str = guard.downcast_ref::<String>().unwrap();
+            let t_str = WatchGuardRef::downcast::<String>(guard).unwrap();
+            assert_eq!(t_str, "hello");
+        }
+
+        let guard = lock.lock_shared();
+        unsafe {
+            let t_str = WatchGuardRef::downcast::<String>(guard).unwrap();
             assert_eq!(t_str, "hello");
         }
     }

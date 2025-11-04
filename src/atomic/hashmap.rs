@@ -399,7 +399,7 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
 
     pub fn clear(&self) {
         for shard_p in self.inner().shards.iter() {
-            let shard = shard_p.lock();
+            let shard = shard_p.lock_exclusive();
             shard.clear();
         }
     }

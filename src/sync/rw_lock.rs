@@ -48,7 +48,7 @@ impl<T> RwLock<T> {
     }
 
     /// Acquire exclusive lock
-    pub fn lock(&self) -> WatchGuardMut<'_, T> {
+    pub fn lock_exclusive(&self) -> WatchGuardMut<'_, T> {
         let inner = self.inner();
         inner.mutex.lock_exclusive();
         WatchGuardMut::new(inner.data.get(), inner.mutex.clone())
@@ -82,6 +82,18 @@ impl<T> RwLock<T> {
         } else {
             None
         }
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.inner().mutex.is_locked()
+    }
+
+    pub fn is_locked_exclusive(&self) -> bool {
+        self.inner().mutex.is_locked_exclusive()
+    }
+
+    pub fn is_locked_shared(&self) -> bool {
+        self.inner().mutex.is_locked_shared()
     }
 }
 
