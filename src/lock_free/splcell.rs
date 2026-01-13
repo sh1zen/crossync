@@ -120,9 +120,7 @@ impl<T> SpinCell<T> {
     }
 
     fn lock_exclusive_slow(&self) -> ExclusiveGuard<'_, T> {
-        let mut acquire_with = UNLOCKED;
         let backoff = Backoff::new();
-
         let mut state = self.state.load(Ordering::Relaxed);
 
         loop {
@@ -130,7 +128,7 @@ impl<T> SpinCell<T> {
             while state & ONE_WRITER == 0 {
                 match self.state.compare_exchange_weak(
                     state,
-                    state | ONE_WRITER | acquire_with,
+                    state | ONE_WRITER,
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
@@ -139,32 +137,25 @@ impl<T> SpinCell<T> {
                 }
             }
 
-            // Mark writers as parked if not already
+            // Set WRITERS_PARKED immediately to prevent new readers
             if state & WRITERS_PARKED == 0 {
-                if !backoff.is_completed() {
-                    backoff.snooze();
-                    continue;
-                }
-
-                if let Err(e) = self.state.compare_exchange_weak(
+                match self.state.compare_exchange_weak(
                     state,
                     state | WRITERS_PARKED,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
-                    state = e;
-                    continue;
+                    Ok(_) => state |= WRITERS_PARKED,
+                    Err(e) => {
+                        state = e;
+                        continue;
+                    }
                 }
             }
 
-            backoff.reset();
-            while state & ONE_WRITER != 0 {
-                backoff.spin();
-                state = self.state.load(Ordering::Relaxed);
-            }
-
-            backoff.reset();
-            acquire_with = WRITERS_PARKED;
+            // Now spin/wait
+            backoff.snooze();
+            state = self.state.load(Ordering::Relaxed);
         }
     }
 
@@ -193,31 +184,34 @@ impl<T> SpinCell<T> {
         loop {
             let mut state = self.state.load(Ordering::Relaxed);
 
-            while let Some(new_state) = state.checked_add(ONE_READER) {
-                if self
-                    .state
-                    .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return SharedGuard { lock: self };
+            // Only try to acquire if no writer is holding or waiting
+            while !is_writer_locked(state) && (state & WRITERS_PARKED == 0) {
+                if let Some(new_state) = state.checked_add(ONE_READER) {
+                    if self
+                        .state
+                        .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        return SharedGuard { lock: self };
+                    }
                 }
-
                 state = self.state.load(Ordering::Relaxed);
             }
 
-            // Mark readers as parked if not already
-            if state & READERS_PARKED == 0 {
-                if !backoff.is_completed() {
-                    backoff.snooze();
-                    continue;
-                }
+            // Writer is active or waiting - back off and wait
+            if !backoff.is_completed() {
+                backoff.snooze();
+                continue;
+            }
 
+            // Mark readers as parked
+            if state & READERS_PARKED == 0 {
                 if self
                     .state
                     .compare_exchange_weak(
                         state,
                         state | READERS_PARKED,
-                        Ordering::Acquire,
+                        Ordering::Relaxed,
                         Ordering::Relaxed,
                     )
                     .is_err()
@@ -226,12 +220,11 @@ impl<T> SpinCell<T> {
                 }
             }
 
+            // Spin while writer holds lock
             backoff.reset();
-            while state & ONE_WRITER == ONE_WRITER {
+            while is_writer_locked(self.state.load(Ordering::Relaxed)) {
                 backoff.spin();
-                state = self.state.load(Ordering::Relaxed);
             }
-
             backoff.reset();
         }
     }

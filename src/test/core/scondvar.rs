@@ -429,15 +429,21 @@ mod tests_scondvar {
     // ==================== Epoch Counter ====================
 
     #[test]
-    fn test_epoch_increments_on_notify() {
+    fn test_notify_adds_wake_tokens() {
         let cv = SCondVar::new();
 
-        let initial = cv.epoch.load(Ordering::Relaxed);
+        // No waiters = no tokens added
         cv.notify_one();
-        assert_eq!(cv.epoch.load(Ordering::Relaxed), initial + 1);
+        assert_eq!(cv.to_wake.load(Ordering::Relaxed), 0);
+
+        // With waiters, tokens are added
+        cv.waiters.store(5, Ordering::SeqCst);
+
+        cv.notify_one();
+        assert_eq!(cv.to_wake.load(Ordering::Relaxed), 1);
 
         cv.notify_all();
-        assert_eq!(cv.epoch.load(Ordering::Relaxed), initial + 2);
+        assert_eq!(cv.to_wake.load(Ordering::Relaxed), 1 + 5);
     }
 
     #[test]
