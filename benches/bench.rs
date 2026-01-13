@@ -1,3 +1,4 @@
+mod bench_array;
 use criterion::criterion_main;
 
 mod bench_hashmap;
@@ -10,6 +11,7 @@ fn bencher() {
 
     bench_hashmap::run();
     bench_vec::run();
+    bench_array::run();
     bench_spincell::run();
 
     println!("======================");

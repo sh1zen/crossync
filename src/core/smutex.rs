@@ -2,67 +2,83 @@ use crate::core::futex::{futex_wait, futex_wake};
 use crate::sync::Backoff;
 use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
-/// Internal bit flags for the sync state.
+/// Internal bit flags
 const UNLOCKED: usize = 0;
 const LOCKED: usize = 1;
-const GROUP_FLAG: usize = 2; // Indicates that group (shared) locks are active
+const GROUP_FLAG: usize = 2;
 
-/// A lightweight futex-based spin sync supporting both
-/// exclusive and group (shared) locking modes.
-///
-/// - Fast path: lock acquisition via atomic CAS.
-/// - Slow path: adaptive spinning with futex sleep.
-/// - Group locks can coexist with others, similar to read locks.
+/// Recursive futex-based mutex supporting exclusive and group (shared) locks
 pub(crate) struct SMutex {
-    state: CachePadded<AtomicUsize>,
+    state: CachePadded<AtomicUsize>, // LOCKED/GROUP_FLAG
+    pub(crate) owner: CachePadded<AtomicUsize>, // thread ID for recursion
+    pub(crate) recursion: CachePadded<AtomicUsize>, // recursion count
 }
 
 impl SMutex {
-    /// Creates a new unlocked sync.
     pub(crate) fn new() -> Self {
         Self {
             state: CachePadded::new(AtomicUsize::new(UNLOCKED)),
+            owner: CachePadded::new(AtomicUsize::new(0)),
+            recursion: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Returns `true` if the sync is currently locked (either exclusive or group).
-    pub(crate) fn is_locked(&self) -> bool {
-        self.state.load(Ordering::Relaxed) & LOCKED != 0
+    fn thread_id() -> usize {
+        // Convert ThreadId to usize
+        let tid: thread::ThreadId = thread::current().id();
+        unsafe { std::mem::transmute::<thread::ThreadId, usize>(tid) }
     }
 
-    /// Acquires the sync in exclusive mode (blocking).
+    /// Exclusive lock
     pub(crate) fn lock(&self) -> SGuard<'_> {
-        self.raw_lock();
-        SGuard::new(self)
-    }
+        let tid = Self::thread_id();
 
-    /// Acquires the sync in group (shared) mode (blocking).
-    pub(crate) fn lock_group(&self) -> SGuard<'_> {
-        self.raw_lock_group();
-        SGuard::new_group(self)
-    }
+        // Fast path: already owner → increment recursion
+        if self.owner.load(Ordering::Relaxed) == tid {
+            self.recursion.fetch_add(1, Ordering::Relaxed);
+            return SGuard::new(self);
+        }
 
-    /// Attempts to lock the sync in exclusive mode (fast path).
-    /// Falls back to the slow path on contention.
-    pub(crate) fn raw_lock(&self) {
-        if self
-            .state
-            .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            self.raw_lock_slow();
+        // Try acquire
+        let spin = Backoff::new();
+        loop {
+            if self
+                .state
+                .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.owner.store(tid, Ordering::Relaxed);
+                self.recursion.store(1, Ordering::Relaxed);
+                return SGuard::new(self);
+            }
+
+            if !spin.is_yielding() {
+                spin.snooze();
+                continue;
+            }
+
+            while self.state.load(Ordering::Relaxed) & LOCKED != 0 {
+                futex_wait(&self.state, LOCKED);
+            }
         }
     }
 
-    /// Locks the sync in group (shared) mode.
-    /// Allows multiple concurrent holders unless a writer is active.
-    fn raw_lock_group(&self) {
+    /// Group/shared lock
+    pub(crate) fn lock_group(&self) -> SGuard<'_> {
+        let tid = Self::thread_id();
+
+        // Already exclusive owner → can reenter
+        if self.owner.load(Ordering::Relaxed) == tid {
+            self.recursion.fetch_add(1, Ordering::Relaxed);
+            return SGuard::new_group(self);
+        }
+
         let spin = Backoff::new();
         loop {
             let mut state = self.state.load(Ordering::Relaxed);
 
-            // If no writer is active, add the group flag
             while state & LOCKED == 0 {
                 let new_state = state | GROUP_FLAG;
                 match self.state.compare_exchange_weak(
@@ -71,19 +87,13 @@ impl SMutex {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => return,
+                    Ok(_) => return SGuard::new_group(self),
                     Err(e) => state = e,
                 }
             }
 
-            // If a writer holds the lock, spin or sleep
             if state & LOCKED != 0 {
-                if !spin.is_yielding() {
-                    spin.snooze();
-                    continue;
-                }
-
-                // Wait until writer releases the lock
+                spin.snooze();
                 while self.state.load(Ordering::Relaxed) & LOCKED != 0 {
                     futex_wait(&self.state, state);
                 }
@@ -91,71 +101,61 @@ impl SMutex {
         }
     }
 
-    /// Slow path for exclusive locking.
-    /// Spins briefly, then waits on futex until the sync becomes available.
-    fn raw_lock_slow(&self) {
-        let spin = Backoff::new();
-        loop {
-            let mut state = self.state.load(Ordering::Relaxed);
-
-            // Try to acquire the lock if currently unlocked
-            while state == UNLOCKED {
-                match self.state.compare_exchange_weak(
-                    UNLOCKED,
-                    LOCKED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(e) => state = e,
-                }
-            }
-
-            // If already locked, spin and eventually sleep
-            if state == LOCKED {
-                if !spin.is_yielding() {
-                    spin.snooze();
-                    continue;
-                }
-
-                while self.state.load(Ordering::Relaxed) == LOCKED {
-                    futex_wait(&self.state, LOCKED);
-                }
-            }
-        }
-    }
-
-    /// Unlocks an exclusive lock and wakes up one waiter.
+    /// Unlock exclusive lock
     pub(crate) fn raw_unlock(&self) {
+        let tid = Self::thread_id();
+        if self.owner.load(Ordering::Relaxed) != tid {
+            panic!("Unlock called by non-owner thread");
+        }
+
+        let rec = self.recursion.fetch_sub(1, Ordering::Relaxed);
+        if rec > 1 {
+            return; // still holds recursion
+        }
+
+        // fully release
+        self.owner.store(0, Ordering::Relaxed);
         self.state.fetch_and(!LOCKED, Ordering::Release);
         futex_wake(&*self.state);
     }
 
-    /// Unlocks a group (shared) lock and wakes up one waiter.
+    /// Unlock group lock
     pub(crate) fn raw_unlock_group(&self) {
+        let tid = Self::thread_id();
+        if self.owner.load(Ordering::Relaxed) == tid {
+            // recursion path
+            let rec = self.recursion.fetch_sub(1, Ordering::Relaxed);
+            if rec > 1 {
+                return;
+            }
+            self.owner.store(0, Ordering::Relaxed);
+        }
+
         self.state.fetch_and(!GROUP_FLAG, Ordering::Release);
         futex_wake(&*self.state);
     }
+
+    pub(crate) fn is_locked(&self) -> bool {
+        self.state.load(Ordering::Relaxed) & LOCKED != 0
+    }
 }
 
-/// RAII guard for SMutex that automatically unlocks on drop.
+/// RAII guard
 pub(crate) struct SGuard<'a> {
-    m: &'a SMutex,
-    is_group: bool,
+    pub(crate) m: &'a SMutex,
+    pub(crate) is_group: bool,
 }
 
 impl<'a> SGuard<'a> {
-    /// Creates a new exclusive guard.
-    fn new(m: &'a SMutex) -> SGuard<'a> {
-        SGuard { m, is_group: false }
+    fn new(m: &'a SMutex) -> Self {
+        Self { m, is_group: false }
     }
 
-    /// Creates a new group (shared) guard.
-    pub(crate) fn new_group(m: &'a SMutex) -> SGuard<'a> {
-        SGuard { m, is_group: true }
+    pub(crate) fn new_group(m: &'a SMutex) -> Self {
+        Self { m, is_group: true }
     }
 
-    /// Explicit unlock (optional manual release before drop).
+    /// Explicit unlock
     pub(crate) fn unlock(this: &SGuard<'_>) {
         if this.is_group {
             this.m.raw_unlock_group();
@@ -164,12 +164,12 @@ impl<'a> SGuard<'a> {
         }
     }
 
-    /// Explicit re-lock (optional reacquisition).
+    /// Explicit lock (reacquire)
     pub(crate) fn lock(this: &SGuard<'_>) {
         if this.is_group {
-            this.m.raw_lock_group();
+            this.m.lock_group();
         } else {
-            this.m.raw_lock();
+            this.m.lock();
         }
     }
 }

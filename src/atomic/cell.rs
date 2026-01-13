@@ -1,9 +1,9 @@
 use crate::sync::{RawMutex, WatchGuardMut, WatchGuardRef};
+use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{self, AtomicUsize, Ordering};
-use crossbeam_utils::CachePadded;
 
 /// Internal representation of the atomic cell.
 /// Provides interior mutability through a Mutex.
@@ -78,50 +78,58 @@ impl<T> AtomicCell<T> {
         self.inner().val.get().cast::<T>()
     }
 
-    /// Consumes the AtomicCell and returns the inner value
+    /// Consumes the AtomicCell and returns the inner value.
+    ///
+    /// # Panics
+    /// Panics if there are other clones of this AtomicCell still alive.
     pub fn into_inner(self) -> T {
-        // Take ownership of the boxed inner
+        // Check that we're the sole owner
+        let ref_count = self.inner().ref_count.load(Ordering::Acquire);
+        assert_eq!(
+            ref_count, 1,
+            "cannot call into_inner with multiple references"
+        );
+
+        // Get the raw pointer and prevent AtomicCell::drop from running
         let ptr = self.ptr as *mut Inner<T>;
+        mem::forget(self);
+
+        // Take ownership of the boxed inner
         let boxed = unsafe { Box::from_raw(ptr) };
 
-        // SAFETY: we own the box, no other references exist
+        // Read the value out. MaybeUninit doesn't drop its contents,
+        // so when boxed is dropped, only the Inner struct is deallocated.
         let value = unsafe { boxed.val.get().read().assume_init() };
 
-        // Prevent double-drop
-        mem::forget(boxed);
-
+        // boxed drops here, deallocating the Inner memory
         value
     }
-}
 
-impl<T: Copy> AtomicCell<T> {
-    /// Load value (copy) from the atomic cell
-    pub fn load(&self) -> T {
-        unsafe { (&*self.inner().val.get()).assume_init() }
-    }
-}
-
-impl<T> AtomicCell<T> {
-    /// Store a value atomically
-    pub fn store(&self, val: T) {
-        if mem::needs_drop::<T>() {
-            // If T needs drop, swap safely
-            drop(self.swap(val));
-        } else {
-            let mut guard = self.get_mut();
-            *guard = val;
-        }
+    /// Atomic update with exclusive closure
+    pub fn update<F>(&self, mut f: F)
+    where
+        F: FnMut(&mut T),
+    {
+        let mut guard = self.get_mut();
+        f(&mut *guard);
     }
 
-    /// Swap current value with new value, returning old value
+    /// Swap the value, returning the old one
     pub fn swap(&self, val: T) -> T {
         let mut guard = self.get_mut();
         mem::replace(&mut *guard, val)
     }
+
+    /// Store a new value, dropping the old one
+    pub fn store(&self, val: T) {
+        let mut guard = self.get_mut();
+        *guard = val;
+    }
 }
 
 impl<T: Copy + Eq> AtomicCell<T> {
-    /// Compare-and-swap: if current == stored, write new
+    /// Compare-and-swap: if current == stored, write new and return Ok(old).
+    /// Otherwise return Err with the guard still held.
     pub fn compare_exchange(&self, current: T, new: T) -> Result<T, WatchGuardMut<'_, T>> {
         let mut guard = self.get_mut();
         if *guard == current {
@@ -146,7 +154,18 @@ impl<T> Drop for AtomicCell<T> {
         if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {
             // Ensure memory ordering before destruction
             atomic::fence(Ordering::Acquire);
-            unsafe { drop(Box::from_raw(self.ptr as *mut Inner<T>)) };
+
+            // SAFETY: We're the last reference, so we can safely drop the inner value
+            unsafe {
+                // First, drop the contained value
+                let val_ptr = (*self.ptr).val.get();
+                std::ptr::drop_in_place((*val_ptr).assume_init_mut());
+
+                // Then deallocate the Inner struct
+                drop(Box::from_raw(self.ptr as *mut Inner<T>));
+            }
         }
     }
 }
+
+

@@ -22,7 +22,7 @@ fn benchmark_concurrent_rw(
         let map_clone = map.clone();
         let barrier_clone = Arc::clone(&barrier);
         let h = thread::spawn(move || {
-            // Wait for all threads to be ready before starting the test
+            // Wait for all threads to be ready before starting the channels
             barrier_clone.wait();
 
             for op_id in 0..n_operations {

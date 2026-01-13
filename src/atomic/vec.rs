@@ -1,123 +1,164 @@
 use crate::atomic::AtomicBuffer;
 use crate::sync::Backoff;
 use crossbeam_utils::CachePadded;
-use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FromIterator;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
-use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
-// Block constants for internal allocation
-const BLOCK_CAP: usize = 32; // number of slots per block
+const BLOCK_CAP: usize = 32;
 const BLOCK_CAP_MASK: usize = BLOCK_CAP - 1;
-const BLOCK_SHIFT: u32 = 5; // log2(BLOCK_CAP)
+const BLOCK_SHIFT: u32 = BLOCK_CAP.trailing_zeros();
 
-// Index metadata flags
-const INDEX_SHIFT: usize = 1; // lower bit reserved for flags
-const HAS_NEXT: usize = 1; // indicates next block exists
+const INDEX_SHIFT: usize = 1;
+const HAS_NEXT: usize = 1;
 
-// Slot state flags
-const WRITE: usize = 1; // slot has been written
-const READ: usize = 2; // slot has been read
+const WRITE: usize = 1;
+const READ: usize = 2;
 
-/// Represents a single slot in a block.
-/// UnsafeCell allows interior mutability without borrowing restrictions.
-/// The state is atomic to allow concurrent access.
+const PENDING_SHIFT: u32 = 32;
+const READ_MASK: u64 = 0xFFFF_FFFF;
+const PENDING_ONE: u64 = 1 << PENDING_SHIFT;
+
+#[inline(always)]
+fn pack_counters(pending: u32, read: u32) -> u64 {
+    ((pending as u64) << PENDING_SHIFT) | (read as u64)
+}
+
+#[inline(always)]
+fn unpack_pending(val: u64) -> u32 {
+    (val >> PENDING_SHIFT) as u32
+}
+
+#[inline(always)]
+fn unpack_read(val: u64) -> u32 {
+    (val & READ_MASK) as u32
+}
+
+#[repr(C)]
 struct Slot<T> {
-    value: UnsafeCell<MaybeUninit<T>>,
     state: AtomicUsize,
+    value: UnsafeCell<MaybeUninit<T>>,
 }
 
 impl<T> Slot<T> {
     #[inline(always)]
-    fn wait_write(&self) {
+    unsafe fn wait_write_raw(state: *const AtomicUsize) {
         let backoff = Backoff::new();
-        // Wait until the slot is written by a producer
-        while self.state.load(Ordering::Acquire) & WRITE == 0 {
-            backoff.snooze();
+        unsafe {
+            while (*state).load(Ordering::Acquire) & WRITE == 0 {
+                backoff.snooze();
+            }
         }
     }
 }
 
-/// Represents a block of slots.
-/// Each block has a next pointer for linked allocation and a read counter
-/// to determine when it can be recycled.
+#[repr(C)]
 struct Block<T> {
-    next: CachePadded<AtomicPtr<Block<T>>>, // pointer to the next block
-    read_count: CachePadded<AtomicUsize>,   // number of successfully read slots
+    next: AtomicPtr<Block<T>>,
+    counters: CachePadded<AtomicU64>,
     slots: [Slot<T>; BLOCK_CAP],
 }
 
 impl<T> Block<T> {
     const LAYOUT: Layout = Layout::new::<Self>();
 
-    /// Allocates a zeroed block in heap memory.
     #[inline]
-    fn new() -> Box<Self> {
+    fn new() -> *mut Self {
         let ptr = unsafe { alloc_zeroed(Self::LAYOUT) };
         if ptr.is_null() {
             handle_alloc_error(Self::LAYOUT)
         }
-        unsafe { Box::from_raw(ptr.cast()) }
+        ptr.cast()
     }
 
-    /// Resets the block metadata for reuse
     #[inline]
-    fn reset(&mut self) {
-        self.next.store(ptr::null_mut(), Ordering::Relaxed);
-        self.read_count.store(0, Ordering::Relaxed);
-        for slot in &self.slots {
-            slot.state.store(0, Ordering::Relaxed);
+    unsafe fn reset(ptr: *mut Self) {
+        unsafe {
+            (*ptr).next.store(ptr::null_mut(), Ordering::Relaxed);
+            (*ptr).counters.store(0, Ordering::Relaxed);
+            let slots = &(*ptr).slots;
+            for slot in slots.iter() {
+                slot.state.store(0, Ordering::Relaxed);
+            }
         }
     }
 
     #[inline(always)]
+    fn inc_pending(&self) -> u64 {
+        self.counters.fetch_add(PENDING_ONE, Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    fn dec_pending_inc_read(&self) -> (u32, u32) {
+        let delta = 1u64.wrapping_sub(PENDING_ONE);
+        let old = self.counters.fetch_add(delta, Ordering::AcqRel);
+        let new = old.wrapping_add(delta);
+        (unpack_pending(new), unpack_read(new))
+    }
+
+    #[inline(always)]
+    fn dec_pending(&self) {
+        self.counters.fetch_sub(PENDING_ONE, Ordering::Release);
+    }
+
+    #[inline(always)]
     fn wait_next(&self) -> *mut Self {
+        let mut next = self.next.load(Ordering::Acquire);
+        if !next.is_null() {
+            return next;
+        }
         let backoff = Backoff::new();
         loop {
-            let next = self.next.load(Ordering::Acquire);
+            backoff.snooze();
+            next = self.next.load(Ordering::Acquire);
             if !next.is_null() {
                 return next;
             }
-            backoff.snooze();
         }
+    }
+
+    #[inline(always)]
+    fn get_next(&self) -> *mut Self {
+        self.next.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    unsafe fn dealloc(ptr: *mut Self) {
+        unsafe { dealloc(ptr.cast(), Self::LAYOUT) };
     }
 }
 
-/// Cache of block pointers for fast access by index.
-/// Uses index tagging to avoid contention.
 struct BlockArray<T> {
     entries: [CachePadded<BlockEntry<T>>; BLOCK_CAP],
 }
 
 struct BlockEntry<T> {
-    index: AtomicUsize,       // logical index of block
-    ptr: AtomicPtr<Block<T>>, // pointer to the block
+    tagged: AtomicUsize,
+    ptr: AtomicPtr<Block<T>>,
 }
 
 impl<T> BlockArray<T> {
     fn new() -> Self {
-        const INIT_ENTRY: CachePadded<BlockEntry<()>> = CachePadded::new(BlockEntry {
-            index: AtomicUsize::new(usize::MAX), // invalid
+        const INIT: CachePadded<BlockEntry<()>> = CachePadded::new(BlockEntry {
+            tagged: AtomicUsize::new(usize::MAX),
             ptr: AtomicPtr::new(ptr::null_mut()),
         });
-
-        let entries: [CachePadded<BlockEntry<()>>; BLOCK_CAP] = [INIT_ENTRY; BLOCK_CAP];
-
         unsafe {
             Self {
-                entries: mem::transmute(entries),
+                entries: mem::transmute([INIT; BLOCK_CAP]),
             }
         }
     }
 
     #[inline(always)]
     fn get(&self, idx: usize) -> *mut Block<T> {
-        let slot = &self.entries[idx & BLOCK_CAP_MASK];
-        if slot.index.load(Ordering::Acquire) == idx {
-            slot.ptr.load(Ordering::Acquire)
+        let e = unsafe { self.entries.get_unchecked(idx & BLOCK_CAP_MASK) };
+        if e.tagged.load(Ordering::Acquire) == idx {
+            e.ptr.load(Ordering::Relaxed)
         } else {
             ptr::null_mut()
         }
@@ -125,36 +166,40 @@ impl<T> BlockArray<T> {
 
     #[inline(always)]
     fn set(&self, idx: usize, block: *mut Block<T>) {
-        let slot = &self.entries[idx & BLOCK_CAP_MASK];
-        // write pointer first, then index to avoid race where index is seen but pointer is not ready
-        slot.ptr.store(block, Ordering::Release);
-        slot.index.store(idx, Ordering::Release);
+        let e = unsafe { self.entries.get_unchecked(idx & BLOCK_CAP_MASK) };
+        e.ptr.store(block, Ordering::Relaxed);
+        e.tagged.store(idx, Ordering::Release);
     }
 
     #[inline(always)]
-    fn reset(&self, idx: usize) {
-        self.set(idx, ptr::null_mut());
+    fn clear(&self, idx: usize) {
+        let e = unsafe { self.entries.get_unchecked(idx & BLOCK_CAP_MASK) };
+        e.tagged.store(usize::MAX, Ordering::Release);
     }
 }
 
-/// Represents a position (head/tail) in the vector.
+#[repr(C, align(128))]
 struct Position<T> {
     index: AtomicUsize,
     block: AtomicPtr<Block<T>>,
 }
 
-/// The internal representation of the vector.
+struct RecycleEntry<T> {
+    block: *mut Block<T>,
+    block_idx: usize,
+}
+
 struct InnerVec<T> {
     head: CachePadded<Position<T>>,
     tail: CachePadded<Position<T>>,
     len: CachePadded<AtomicUsize>,
     block_array: BlockArray<T>,
-    free_list: AtomicBuffer<Block<T>>, // free list of reusable blocks
-    ref_count: CachePadded<AtomicUsize>, // reference count for cloning
-    lock: CachePadded<AtomicUsize>,    // shared/exclusive lock
+    free_list: AtomicBuffer<Block<T>>,
+    recycle_queue: AtomicBuffer<RecycleEntry<T>>,
+    ref_count: AtomicUsize,
+    exclusive_lock: AtomicUsize,
 }
 
-/// Thread-safe vector with atomic operations.
 #[repr(transparent)]
 pub struct AtomicVec<T> {
     inner: *const InnerVec<T>,
@@ -164,7 +209,6 @@ unsafe impl<T: Send> Send for AtomicVec<T> {}
 unsafe impl<T: Send> Sync for AtomicVec<T> {}
 
 impl<T> AtomicVec<T> {
-    /// Creates a new empty atomic vector.
     #[inline]
     pub fn new() -> Self {
         let inner = InnerVec {
@@ -179,26 +223,38 @@ impl<T> AtomicVec<T> {
             len: CachePadded::new(AtomicUsize::new(0)),
             block_array: BlockArray::new(),
             free_list: AtomicBuffer::with_capacity(64),
-            ref_count: CachePadded::new(AtomicUsize::new(1)),
-            lock: CachePadded::new(AtomicUsize::new(0)),
+            recycle_queue: AtomicBuffer::with_capacity(32),
+            ref_count: AtomicUsize::new(1),
+            exclusive_lock: AtomicUsize::new(0),
         };
 
-        // Allocate and assign the first block
-        let new = Box::into_raw(Block::<T>::new());
-        inner.tail.block.store(new, Ordering::Release);
-        inner.head.block.store(new, Ordering::Release);
-        inner.block_array.set(0, new);
+        let block = Block::<T>::new();
+        inner.tail.block.store(block, Ordering::Relaxed);
+        inner.head.block.store(block, Ordering::Relaxed);
+        inner.block_array.set(0, block);
 
         Self {
             inner: Box::into_raw(Box::new(inner)),
         }
     }
 
-    /// Initializes the vector with a given capacity using a provided initializer.
-    pub fn init_with<F: FnMut() -> T>(cap: usize, mut initializer: F) -> Self {
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
         let vec = Self::new();
+        let blocks_needed = (cap + BLOCK_CAP - 1) / BLOCK_CAP;
+        for _ in 1..blocks_needed {
+            let block = Block::<T>::new();
+            if vec.inner().free_list.push(block).is_err() {
+                unsafe { Block::dealloc(block) };
+            }
+        }
+        vec
+    }
+
+    pub fn init_with<F: FnMut() -> T>(cap: usize, mut init: F) -> Self {
+        let vec = Self::with_capacity(cap);
         for _ in 0..cap {
-            vec.push(initializer());
+            vec.push(init());
         }
         vec
     }
@@ -210,7 +266,7 @@ impl<T> AtomicVec<T> {
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.inner().len.load(Ordering::Acquire)
+        self.inner().len.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
@@ -221,60 +277,69 @@ impl<T> AtomicVec<T> {
     #[inline]
     pub fn capacity(&self) -> usize {
         let inner = self.inner();
-        let head = inner.head.index.load(Ordering::Acquire) >> INDEX_SHIFT;
-        let tail = inner.tail.index.load(Ordering::Acquire) >> INDEX_SHIFT;
-
-        ((tail - head) & !BLOCK_CAP_MASK) + BLOCK_CAP
+        let head = inner.head.index.load(Ordering::Relaxed) >> INDEX_SHIFT;
+        let tail = inner.tail.index.load(Ordering::Relaxed) >> INDEX_SHIFT;
+        ((tail.wrapping_sub(head)) & !BLOCK_CAP_MASK) + BLOCK_CAP
     }
 
-    /// Acquire a shared lock (readers) with backoff
-    #[inline(always)]
-    fn wait_lock_shared(&self) {
+    #[inline]
+    unsafe fn try_process_recycles(&self) {
         let inner = self.inner();
-        let backoff = Backoff::new();
-
-        // increment readers by 2 (lowest bit reserved for exclusive lock)
-        let prev = inner.lock.fetch_add(2, Ordering::Acquire);
-        if prev & 1 == 1 {
-            // Wait until exclusive lock is released
-            while inner.lock.load(Ordering::Acquire) & 1 == 1 {
-                backoff.snooze();
+        for _ in 0..2 {
+            if let Some(entry_ptr) = inner.recycle_queue.pop() {
+                let entry = unsafe { Box::from_raw(entry_ptr) };
+                let counters = unsafe { (*entry.block).counters.load(Ordering::Acquire) };
+                if unpack_pending(counters) == 0 {
+                    inner.block_array.clear(entry.block_idx);
+                    unsafe {
+                        Block::reset(entry.block);
+                    }
+                    // FIX: Deallocate if free_list is full
+                    if inner.free_list.push(entry.block).is_err() {
+                        unsafe {
+                            Block::dealloc(entry.block);
+                        }
+                    }
+                } else {
+                    let _ = inner.recycle_queue.push(Box::into_raw(entry));
+                    break;
+                }
+            } else {
+                break;
             }
         }
     }
 
-    /// Acquire an exclusive lock (writers) with backoff
-    #[inline(always)]
-    fn wait_lock_exclusive(&self) {
+    #[inline]
+    unsafe fn acquire_block(&self) -> *mut Block<T> {
+        let inner = self.inner();
+        inner.free_list.pop().unwrap_or_else(Block::<T>::new)
+    }
+
+    #[inline]
+    fn wait_exclusive(&self) {
         let inner = self.inner();
         let backoff = Backoff::new();
-
-        loop {
-            match inner
-                .lock
-                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            {
-                Ok(_) => break, 
-                Err(_) => backoff.snooze(),
-            }
+        while inner
+            .exclusive_lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            backoff.snooze();
         }
     }
 
-    #[inline(always)]
-    fn release_lock_shared(&self) {
-        self.inner().lock.fetch_sub(2, Ordering::Release);
+    #[inline]
+    fn release_exclusive(&self) {
+        self.inner().exclusive_lock.store(0, Ordering::Release);
     }
 
-    #[inline(always)]
-    fn release_lock_exclusive(&self) {
-        self.inner().lock.store(0, Ordering::Release);
-    }
-
-    /// Push a value without acquiring the shared lock.
-    /// Unsafe because concurrent access may occur if called externally.
-    pub unsafe fn push_unchecked(&self, value: T) {
+    #[inline]
+    pub fn push(&self, value: T) {
         unsafe {
             let inner = self.inner();
+            self.try_process_recycles();
+
             let backoff = Backoff::new();
             let mut tail = inner.tail.index.load(Ordering::Acquire);
             let mut block = inner.tail.block.load(Ordering::Acquire);
@@ -283,7 +348,6 @@ impl<T> AtomicVec<T> {
                 let offset = (tail >> INDEX_SHIFT) & BLOCK_CAP_MASK;
 
                 if offset == BLOCK_CAP - 1 {
-                    // If tail reached block end, reload tail and block
                     backoff.snooze();
                     tail = inner.tail.index.load(Ordering::Acquire);
                     block = inner.tail.block.load(Ordering::Acquire);
@@ -292,66 +356,54 @@ impl<T> AtomicVec<T> {
 
                 let new_tail = tail + (1 << INDEX_SHIFT);
 
-                // Atomically claim the next slot
                 match inner.tail.index.compare_exchange_weak(
                     tail,
                     new_tail,
-                    Ordering::Release,
+                    Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
-                        // Preallocate next block if this is the last slot in current block
                         if offset + 1 == BLOCK_CAP - 1 {
-                            let next = inner
-                                .free_list
-                                .pop()
-                                .unwrap_or_else(|| Box::into_raw(Block::<T>::new()));
+                            let next = self.acquire_block();
                             let next_index = new_tail.wrapping_add(1 << INDEX_SHIFT);
                             let block_idx = (new_tail >> INDEX_SHIFT) >> BLOCK_SHIFT;
 
-                            inner.tail.block.store(next, Ordering::Release);
-                            inner.tail.index.store(next_index, Ordering::Release);
                             (*block).next.store(next, Ordering::Release);
                             inner.block_array.set(block_idx + 1, next);
+                            inner.tail.block.store(next, Ordering::Release);
+                            inner.tail.index.store(next_index, Ordering::Release);
                         }
 
-                        // Write the value to the slot
                         let slot = (*block).slots.get_unchecked(offset);
                         slot.value.get().write(MaybeUninit::new(value));
-                        // Publish the WRITE state to signal readers
                         slot.state.store(WRITE, Ordering::Release);
 
-                        // Increment the vector length
-                        inner.len.fetch_add(1, Ordering::Release);
+                        inner.len.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                     Err(t) => {
-                        // CAS failed, reload tail and block and retry
                         tail = t;
                         block = inner.tail.block.load(Ordering::Acquire);
-                        backoff.snooze();
+                        backoff.spin();
                     }
                 }
             }
         }
     }
 
-    /// Thread-safe push with shared lock.
-    pub fn push(&self, value: T) {
-        self.wait_lock_shared();
-        unsafe {
-            self.push_unchecked(value);
+    #[inline]
+    pub fn push_batch<I: IntoIterator<Item = T>>(&self, iter: I) {
+        for value in iter {
+            self.push(value);
         }
-        self.release_lock_shared();
     }
 
-    /// Pop a value without acquiring the shared lock.
-    /// Unsafe because concurrent access may occur if called externally.
-    pub unsafe fn pop_unchecked(&self) -> Option<T> {
+    #[inline]
+    pub fn pop(&self) -> Option<T> {
         unsafe {
             let inner = self.inner();
 
-            if inner.len.load(Ordering::Acquire) == 0 {
+            if inner.len.load(Ordering::Relaxed) == 0 {
                 return None;
             }
 
@@ -363,7 +415,6 @@ impl<T> AtomicVec<T> {
                 let offset = (head >> INDEX_SHIFT) & BLOCK_CAP_MASK;
 
                 if offset == BLOCK_CAP - 1 || block.is_null() {
-                    // End of block or null block, reload head and block
                     backoff.snooze();
                     head = inner.head.index.load(Ordering::Acquire);
                     block = inner.head.block.load(Ordering::Acquire);
@@ -372,7 +423,6 @@ impl<T> AtomicVec<T> {
 
                 let mut new_head = head + (1 << INDEX_SHIFT);
 
-                // Update HAS_NEXT flag if moving to next block
                 if new_head & HAS_NEXT == 0 {
                     fence(Ordering::SeqCst);
                     let tail = inner.tail.index.load(Ordering::Relaxed);
@@ -380,7 +430,7 @@ impl<T> AtomicVec<T> {
                     let tail_idx = tail >> INDEX_SHIFT;
 
                     if head_idx == tail_idx {
-                        return None; // Vector is empty
+                        return None;
                     }
 
                     if (head_idx >> BLOCK_SHIFT) != (tail_idx >> BLOCK_SHIFT) {
@@ -388,21 +438,21 @@ impl<T> AtomicVec<T> {
                     }
                 }
 
-                // Atomically advance the head
+                (*block).inc_pending();
+
                 match inner.head.index.compare_exchange_weak(
                     head,
                     new_head,
-                    Ordering::Release,
+                    Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
-                        // Advance to next block if needed
                         if offset + 1 == BLOCK_CAP - 1 {
                             let next = (*block).wait_next();
                             let mut next_index =
                                 (new_head & !HAS_NEXT).wrapping_add(1 << INDEX_SHIFT);
 
-                            if !(*next).next.load(Ordering::Relaxed).is_null() {
+                            if !(*next).get_next().is_null() {
                                 next_index |= HAS_NEXT;
                             }
 
@@ -410,29 +460,39 @@ impl<T> AtomicVec<T> {
                             inner.head.index.store(next_index, Ordering::Release);
                         }
 
-                        // Read the value from the slot
                         let slot = (*block).slots.get_unchecked(offset);
-                        slot.wait_write(); // wait until the slot is written
+                        Slot::<T>::wait_write_raw(&slot.state as *const _);
                         let value = slot.value.get().read().assume_init();
-                        slot.state.store(READ, Ordering::Release);
+                        slot.state.store(READ, Ordering::Relaxed);
 
-                        // Update the vector length
-                        inner.len.fetch_sub(1, Ordering::Release);
+                        inner.len.fetch_sub(1, Ordering::Relaxed);
 
-                        // Recycle block if all slots read
-                        if (*block).read_count.fetch_add(1, Ordering::AcqRel) + 1 == BLOCK_CAP - 1 {
+                        let (pending, read_count) = (*block).dec_pending_inc_read();
+
+                        if read_count == (BLOCK_CAP - 1) as u32 {
                             let block_idx = (head >> INDEX_SHIFT) >> BLOCK_SHIFT;
-                            inner.block_array.reset(block_idx);
-                            (*block).reset();
-                            if let Err(e) = inner.free_list.push(block) {
-                                drop(Box::from_raw(e));
+                            if pending == 0 {
+                                inner.block_array.clear(block_idx);
+                                Block::reset(block);
+                                // FIX: Deallocate if free_list is full
+                                if inner.free_list.push(block).is_err() {
+                                    Block::dealloc(block);
+                                }
+                            } else {
+                                let entry =
+                                    Box::into_raw(Box::new(RecycleEntry { block, block_idx }));
+                                if inner.recycle_queue.push(entry).is_err() {
+                                    // FIX: Deallocate both entry and block
+                                    drop(Box::from_raw(entry));
+                                    Block::dealloc(block);
+                                }
                             }
                         }
 
                         return Some(value);
                     }
                     Err(h) => {
-                        // CAS failed, reload head and block
+                        (*block).dec_pending();
                         head = h;
                         block = inner.head.block.load(Ordering::Acquire);
                         backoff.spin();
@@ -442,18 +502,42 @@ impl<T> AtomicVec<T> {
         }
     }
 
-    /// Thread-safe pop with shared lock.
-    pub fn pop(&self) -> Option<T> {
-        self.wait_lock_shared();
-        let val = unsafe { self.pop_unchecked() };
-        self.release_lock_shared();
-        val
+    #[inline]
+    pub fn pop_batch(&self, count: usize) -> Vec<T> {
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.pop() {
+                Some(v) => out.push(v),
+                None => break,
+            }
+        }
+        out
     }
 
-    /// Reset the vector to a new capacity using a provided initializer.
-    pub fn reset_with(&self, new_cap: usize, mut initializer: impl FnMut() -> T) -> usize {
+    pub fn drain(&self) -> Vec<T> {
+        let len = self.len();
+        self.pop_batch(len)
+    }
+
+    pub fn reset_with(&self, cap: usize, mut init: impl FnMut() -> T) -> usize {
+        self.wait_exclusive();
+
         let inner = self.inner();
-        self.wait_lock_exclusive();
+
+        while self.pop().is_some() {}
+
+        unsafe {
+            while let Some(entry_ptr) = inner.recycle_queue.pop() {
+                let entry = Box::from_raw(entry_ptr);
+                inner.block_array.clear(entry.block_idx);
+                Block::reset(entry.block);
+                if inner.free_list.push(entry.block).is_err() {
+                    Block::dealloc(entry.block);
+                }
+            }
+        }
+
+        let old_block = inner.head.block.load(Ordering::Relaxed);
 
         inner.head.index.store(0, Ordering::Relaxed);
         inner.tail.index.store(0, Ordering::Relaxed);
@@ -464,109 +548,641 @@ impl<T> AtomicVec<T> {
         }
 
         unsafe {
-            for _ in 0..new_cap {
-                self.push_unchecked(initializer());
+            if !old_block.is_null() {
+                Block::reset(old_block);
+                inner.tail.block.store(old_block, Ordering::Relaxed);
+                inner.head.block.store(old_block, Ordering::Relaxed);
+                inner.block_array.set(0, old_block);
+            } else {
+                let block = self.acquire_block();
+                inner.tail.block.store(block, Ordering::Relaxed);
+                inner.head.block.store(block, Ordering::Relaxed);
+                inner.block_array.set(0, block);
             }
         }
 
-        self.release_lock_exclusive();
-        new_cap
+        for _ in 0..cap {
+            self.push(init());
+        }
+
+        self.release_exclusive();
+        cap
     }
 
-    /// Convert the atomic vector into a standard Vec<T>.
-    /// Consumes all elements, thread-safely.
     pub fn as_vec(&self) -> Vec<T> {
-        let mut out = Vec::with_capacity(self.len());
-        if self.is_empty() {
-            return out;
-        }
-
-        self.wait_lock_exclusive();
-        unsafe {
-            while let Some(value) = self.pop_unchecked() {
-                out.push(value);
-            }
-        }
-        self.release_lock_exclusive();
+        self.wait_exclusive();
+        let out = self.drain();
+        self.release_exclusive();
         out
     }
 }
 
-impl<T> Clone for AtomicVec<T> {
-    /// Cloning the AtomicVec only increases the reference count.
-    /// The underlying data is shared safely between clones.
-    fn clone(&self) -> Self {
+impl<T: PartialEq> AtomicVec<T> {
+    pub fn index_of(&self, value: &T) -> Option<usize> {
+        self.wait_exclusive();
+        let result = self.index_of_inner(value);
+        self.release_exclusive();
+        result
+    }
+
+    fn index_of_inner(&self, value: &T) -> Option<usize> {
+        unsafe {
+            let inner = self.inner();
+            let mut block = inner.head.block.load(Ordering::Acquire);
+            let head = inner.head.index.load(Ordering::Acquire);
+            let tail = inner.tail.index.load(Ordering::Acquire);
+
+            let start_idx = head >> INDEX_SHIFT;
+            let end_idx = tail >> INDEX_SHIFT;
+            let mut logical_idx = 0usize;
+
+            let mut block_start = start_idx & !BLOCK_CAP_MASK;
+            let mut offset = start_idx & BLOCK_CAP_MASK;
+
+            while block_start < end_idx && !block.is_null() {
+                let block_end = ((block_start + BLOCK_CAP) - 1).min(end_idx);
+
+                while (block_start + offset) < block_end && offset < BLOCK_CAP - 1 {
+                    let slot = &(*block).slots[offset];
+                    if slot.state.load(Ordering::Acquire) & WRITE != 0 {
+                        let v = &*(*slot.value.get()).as_ptr();
+                        if v == value {
+                            return Some(logical_idx);
+                        }
+                    }
+                    offset += 1;
+                    logical_idx += 1;
+                }
+
+                block = (*block).next.load(Ordering::Acquire);
+                block_start += BLOCK_CAP;
+                offset = 0;
+            }
+            None
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, value: &T) -> bool {
+        self.index_of(value).is_some()
+    }
+}
+
+impl<T> AtomicVec<T> {
+    pub fn find<F>(&self, predicate: F) -> Option<T>
+    where
+        F: Fn(&T) -> bool,
+        T: Clone,
+    {
+        self.wait_exclusive();
+        let result = self.find_inner(predicate);
+        self.release_exclusive();
+        result
+    }
+
+    fn find_inner<F>(&self, predicate: F) -> Option<T>
+    where
+        F: Fn(&T) -> bool,
+        T: Clone,
+    {
+        unsafe {
+            let inner = self.inner();
+            let mut block = inner.head.block.load(Ordering::Acquire);
+            let head = inner.head.index.load(Ordering::Acquire);
+            let tail = inner.tail.index.load(Ordering::Acquire);
+
+            let start_idx = head >> INDEX_SHIFT;
+            let end_idx = tail >> INDEX_SHIFT;
+
+            let mut block_start = start_idx & !BLOCK_CAP_MASK;
+            let mut offset = start_idx & BLOCK_CAP_MASK;
+
+            while block_start < end_idx && !block.is_null() {
+                let block_end = ((block_start + BLOCK_CAP) - 1).min(end_idx);
+
+                while (block_start + offset) < block_end && offset < BLOCK_CAP - 1 {
+                    let slot = &(*block).slots[offset];
+                    if slot.state.load(Ordering::Acquire) & WRITE != 0 {
+                        let v = &*(*slot.value.get()).as_ptr();
+                        if predicate(v) {
+                            return Some(v.clone());
+                        }
+                    }
+                    offset += 1;
+                }
+
+                block = (*block).next.load(Ordering::Acquire);
+                block_start += BLOCK_CAP;
+                offset = 0;
+            }
+            None
+        }
+    }
+
+    pub fn for_each<F>(&self, f: F)
+    where
+        F: Fn(&T),
+    {
+        self.wait_exclusive();
+        self.for_each_inner(f);
+        self.release_exclusive();
+    }
+
+    fn for_each_inner<F>(&self, f: F)
+    where
+        F: Fn(&T),
+    {
+        unsafe {
+            let inner = self.inner();
+            let mut block = inner.head.block.load(Ordering::Acquire);
+            let head = inner.head.index.load(Ordering::Acquire);
+            let tail = inner.tail.index.load(Ordering::Acquire);
+
+            let start_idx = head >> INDEX_SHIFT;
+            let end_idx = tail >> INDEX_SHIFT;
+
+            let mut block_start = start_idx & !BLOCK_CAP_MASK;
+            let mut offset = start_idx & BLOCK_CAP_MASK;
+
+            while block_start < end_idx && !block.is_null() {
+                let block_end = ((block_start + BLOCK_CAP) - 1).min(end_idx);
+
+                while (block_start + offset) < block_end && offset < BLOCK_CAP - 1 {
+                    let slot = &(*block).slots[offset];
+                    if slot.state.load(Ordering::Acquire) & WRITE != 0 {
+                        let v = &*(*slot.value.get()).as_ptr();
+                        f(v);
+                    }
+                    offset += 1;
+                }
+
+                block = (*block).next.load(Ordering::Acquire);
+                block_start += BLOCK_CAP;
+                offset = 0;
+            }
+        }
+    }
+
+    pub fn fold<B, F>(&self, init: B, f: F) -> B
+    where
+        F: Fn(B, &T) -> B,
+    {
+        self.wait_exclusive();
+        let result = self.fold_inner(init, f);
+        self.release_exclusive();
+        result
+    }
+
+    fn fold_inner<B, F>(&self, init: B, f: F) -> B
+    where
+        F: Fn(B, &T) -> B,
+    {
+        unsafe {
+            let inner = self.inner();
+            let mut block = inner.head.block.load(Ordering::Acquire);
+            let head = inner.head.index.load(Ordering::Acquire);
+            let tail = inner.tail.index.load(Ordering::Acquire);
+
+            let start_idx = head >> INDEX_SHIFT;
+            let end_idx = tail >> INDEX_SHIFT;
+
+            let mut acc = init;
+            let mut block_start = start_idx & !BLOCK_CAP_MASK;
+            let mut offset = start_idx & BLOCK_CAP_MASK;
+
+            while block_start < end_idx && !block.is_null() {
+                let block_end = ((block_start + BLOCK_CAP) - 1).min(end_idx);
+
+                while (block_start + offset) < block_end && offset < BLOCK_CAP - 1 {
+                    let slot = &(*block).slots[offset];
+                    if slot.state.load(Ordering::Acquire) & WRITE != 0 {
+                        let v = &*(*slot.value.get()).as_ptr();
+                        acc = f(acc, v);
+                    }
+                    offset += 1;
+                }
+
+                block = (*block).next.load(Ordering::Acquire);
+                block_start += BLOCK_CAP;
+                offset = 0;
+            }
+            acc
+        }
+    }
+
+    pub fn reduce<F>(&self, f: F) -> Option<T>
+    where
+        F: Fn(T, &T) -> T,
+        T: Clone,
+    {
+        self.wait_exclusive();
+        let result = self.reduce_inner(f);
+        self.release_exclusive();
+        result
+    }
+
+    fn reduce_inner<F>(&self, f: F) -> Option<T>
+    where
+        F: Fn(T, &T) -> T,
+        T: Clone,
+    {
+        unsafe {
+            let inner = self.inner();
+            let mut block = inner.head.block.load(Ordering::Acquire);
+            let head = inner.head.index.load(Ordering::Acquire);
+            let tail = inner.tail.index.load(Ordering::Acquire);
+
+            let start_idx = head >> INDEX_SHIFT;
+            let end_idx = tail >> INDEX_SHIFT;
+
+            if start_idx >= end_idx {
+                return None;
+            }
+
+            let mut acc: Option<T> = None;
+            let mut block_start = start_idx & !BLOCK_CAP_MASK;
+            let mut offset = start_idx & BLOCK_CAP_MASK;
+
+            while block_start < end_idx && !block.is_null() {
+                let block_end = ((block_start + BLOCK_CAP) - 1).min(end_idx);
+
+                while (block_start + offset) < block_end && offset < BLOCK_CAP - 1 {
+                    let slot = &(*block).slots[offset];
+                    if slot.state.load(Ordering::Acquire) & WRITE != 0 {
+                        let v = &*(*slot.value.get()).as_ptr();
+                        acc = Some(match acc {
+                            None => v.clone(),
+                            Some(a) => f(a, v),
+                        });
+                    }
+                    offset += 1;
+                }
+
+                block = (*block).next.load(Ordering::Acquire);
+                block_start += BLOCK_CAP;
+                offset = 0;
+            }
+            acc
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.wait_exclusive();
+        let result = self.get_inner(index);
+        self.release_exclusive();
+        result
+    }
+
+    fn get_inner(&self, index: usize) -> Option<T>
+    where
+        T: Clone,
+    {
+        unsafe {
+            let inner = self.inner();
+            let head = inner.head.index.load(Ordering::Acquire);
+            let tail = inner.tail.index.load(Ordering::Acquire);
+
+            let start_idx = head >> INDEX_SHIFT;
+            let end_idx = tail >> INDEX_SHIFT;
+            let len = self.calc_len(start_idx, end_idx);
+
+            if index >= len {
+                return None;
+            }
+
+            let target_abs = start_idx + index;
+            let offset = target_abs & BLOCK_CAP_MASK;
+
+            let adjusted_offset = offset + (target_abs / (BLOCK_CAP - 1));
+            let adjusted_block_idx = (start_idx + adjusted_offset) >> BLOCK_SHIFT;
+            let final_offset = (start_idx + adjusted_offset) & BLOCK_CAP_MASK;
+
+            let block = self.get_block_at(adjusted_block_idx, start_idx >> BLOCK_SHIFT);
+            if block.is_null() || final_offset >= BLOCK_CAP - 1 {
+                return None;
+            }
+
+            let slot = &(*block).slots[final_offset];
+            if slot.state.load(Ordering::Acquire) & WRITE != 0 {
+                Some((*(*slot.value.get()).as_ptr()).clone())
+            } else {
+                None
+            }
+        }
+    }
+
+    fn calc_len(&self, start: usize, end: usize) -> usize {
+        if end <= start {
+            return 0;
+        }
+        let total_slots = end - start;
+        let full_blocks = total_slots / BLOCK_CAP;
+        let remainder = total_slots % BLOCK_CAP;
+        full_blocks * (BLOCK_CAP - 1) + remainder.min(BLOCK_CAP - 1)
+    }
+
+    unsafe fn get_block_at(&self, target_block: usize, start_block: usize) -> *mut Block<T> {
         let inner = self.inner();
-        inner.ref_count.fetch_add(1, Ordering::Relaxed); // increment ref count
+
+        let cached = inner.block_array.get(target_block);
+        if !cached.is_null() {
+            return cached;
+        }
+
+        let mut block = inner.head.block.load(Ordering::Acquire);
+        let mut current_block = start_block;
+
+        while current_block < target_block && !block.is_null() {
+            block = unsafe { (*block).next.load(Ordering::Acquire) };
+            current_block += 1;
+        }
+        block
+    }
+
+    pub fn swap(&self, i: usize, j: usize) -> bool {
+        if i == j {
+            return true;
+        }
+        self.wait_exclusive();
+        let result = self.swap_inner(i, j);
+        self.release_exclusive();
+        result
+    }
+
+    fn swap_inner(&self, i: usize, j: usize) -> bool {
+        unsafe {
+            let inner = self.inner();
+            let head = inner.head.index.load(Ordering::Acquire);
+            let tail = inner.tail.index.load(Ordering::Acquire);
+            let start_idx = head >> INDEX_SHIFT;
+            let end_idx = tail >> INDEX_SHIFT;
+            let len = self.calc_len(start_idx, end_idx);
+
+            if i >= len || j >= len {
+                return false;
+            }
+
+            let (ptr_i, ptr_j) = (
+                self.get_slot_ptr(i, start_idx),
+                self.get_slot_ptr(j, start_idx),
+            );
+
+            if ptr_i.is_null() || ptr_j.is_null() {
+                return false;
+            }
+
+            ptr::swap((*ptr_i).value.get(), (*ptr_j).value.get());
+            true
+        }
+    }
+
+    unsafe fn get_slot_ptr(&self, index: usize, start_idx: usize) -> *mut Slot<T> {
+        let slots_per_block = BLOCK_CAP - 1;
+        let block_num = index / slots_per_block;
+        let slot_in_block = index % slots_per_block;
+
+        let target_block = (start_idx >> BLOCK_SHIFT) + block_num;
+        let block = unsafe { self.get_block_at(target_block, start_idx >> BLOCK_SHIFT) };
+
+        if block.is_null() {
+            return ptr::null_mut();
+        }
+
+        let base_offset = if block_num == 0 {
+            start_idx & BLOCK_CAP_MASK
+        } else {
+            0
+        };
+
+        let offset = base_offset + slot_in_block;
+        if offset >= BLOCK_CAP - 1 {
+            return ptr::null_mut();
+        }
+
+        unsafe { (*block).slots.as_mut_ptr().add(offset) }
+    }
+
+    pub fn remove(&self, index: usize) -> Option<T> {
+        self.wait_exclusive();
+        let result = self.remove_inner(index);
+        self.release_exclusive();
+        result
+    }
+
+    fn remove_inner(&self, index: usize) -> Option<T> {
+        let len = self.len();
+        if index >= len {
+            return None;
+        }
+
+        let mut elements = Vec::with_capacity(len);
+        while let Some(v) = self.pop_internal() {
+            elements.push(v);
+        }
+
+        if index >= elements.len() {
+            for v in elements {
+                self.push(v);
+            }
+            return None;
+        }
+
+        let removed = elements.remove(index);
+
+        for v in elements {
+            self.push(v);
+        }
+
+        Some(removed)
+    }
+
+    pub fn reverse(&self) {
+        self.wait_exclusive();
+        self.reverse_inner();
+        self.release_exclusive();
+    }
+
+    fn reverse_inner(&self) {
+        let mut elements = Vec::new();
+        while let Some(v) = self.pop_internal() {
+            elements.push(v);
+        }
+
+        for v in elements.into_iter().rev() {
+            self.push(v);
+        }
+    }
+
+    fn pop_internal(&self) -> Option<T> {
+        unsafe {
+            let inner = self.inner();
+
+            if inner.len.load(Ordering::Relaxed) == 0 {
+                return None;
+            }
+
+            let backoff = Backoff::new();
+            let mut head = inner.head.index.load(Ordering::Acquire);
+            let mut block = inner.head.block.load(Ordering::Acquire);
+
+            loop {
+                let offset = (head >> INDEX_SHIFT) & BLOCK_CAP_MASK;
+
+                if offset == BLOCK_CAP - 1 || block.is_null() {
+                    backoff.snooze();
+                    head = inner.head.index.load(Ordering::Acquire);
+                    block = inner.head.block.load(Ordering::Acquire);
+                    continue;
+                }
+
+                let mut new_head = head + (1 << INDEX_SHIFT);
+
+                if new_head & HAS_NEXT == 0 {
+                    fence(Ordering::SeqCst);
+                    let tail = inner.tail.index.load(Ordering::Relaxed);
+                    let head_idx = head >> INDEX_SHIFT;
+                    let tail_idx = tail >> INDEX_SHIFT;
+
+                    if head_idx == tail_idx {
+                        return None;
+                    }
+
+                    if (head_idx >> BLOCK_SHIFT) != (tail_idx >> BLOCK_SHIFT) {
+                        new_head |= HAS_NEXT;
+                    }
+                }
+
+                (*block).inc_pending();
+
+                match inner.head.index.compare_exchange_weak(
+                    head,
+                    new_head,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        if offset + 1 == BLOCK_CAP - 1 {
+                            let next = (*block).wait_next();
+                            let mut next_index =
+                                (new_head & !HAS_NEXT).wrapping_add(1 << INDEX_SHIFT);
+
+                            if !(*next).get_next().is_null() {
+                                next_index |= HAS_NEXT;
+                            }
+
+                            inner.head.block.store(next, Ordering::Release);
+                            inner.head.index.store(next_index, Ordering::Release);
+                        }
+
+                        let slot = (*block).slots.get_unchecked(offset);
+                        Slot::<T>::wait_write_raw(&slot.state as *const _);
+                        let value = slot.value.get().read().assume_init();
+                        slot.state.store(READ, Ordering::Relaxed);
+
+                        inner.len.fetch_sub(1, Ordering::Relaxed);
+
+                        let (pending, read_count) = (*block).dec_pending_inc_read();
+
+                        if read_count == (BLOCK_CAP - 1) as u32 {
+                            let block_idx = (head >> INDEX_SHIFT) >> BLOCK_SHIFT;
+                            if pending == 0 {
+                                inner.block_array.clear(block_idx);
+                                Block::reset(block);
+                                // FIX: Deallocate if free_list is full
+                                if inner.free_list.push(block).is_err() {
+                                    Block::dealloc(block);
+                                }
+                            } else {
+                                let entry =
+                                    Box::into_raw(Box::new(RecycleEntry { block, block_idx }));
+                                if inner.recycle_queue.push(entry).is_err() {
+                                    // FIX: Deallocate both entry and block
+                                    drop(Box::from_raw(entry));
+                                    Block::dealloc(block);
+                                }
+                            }
+                        }
+
+                        return Some(value);
+                    }
+                    Err(h) => {
+                        (*block).dec_pending();
+                        head = h;
+                        block = inner.head.block.load(Ordering::Acquire);
+                        backoff.spin();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T> Clone for AtomicVec<T> {
+    fn clone(&self) -> Self {
+        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
         Self { inner: self.inner }
     }
 }
 
 impl<T> Drop for AtomicVec<T> {
-    /// Drops the AtomicVec.
-    /// If this is the last reference, deallocates all blocks and inner structures.
     fn drop(&mut self) {
         let inner = unsafe { &*self.inner };
 
-        // Only deallocate if this is the last reference
         if inner.ref_count.fetch_sub(1, Ordering::Release) != 1 {
             return;
         }
-        fence(Ordering::Acquire); // synchronize with other threads
+        fence(Ordering::Acquire);
 
         unsafe {
-            // 1. Release all blocks from head to tail
             let mut block = inner.head.block.load(Ordering::Relaxed);
-
             while !block.is_null() {
                 let next = (*block).next.load(Ordering::Relaxed);
 
-                // Drop all written elements in the block if T needs drop
                 if mem::needs_drop::<T>() {
                     for slot in &(*block).slots {
-                        if slot.state.load(Ordering::Relaxed) & WRITE != 0 {
-                            ptr::drop_in_place(slot.value.get());
+                        let state = slot.state.load(Ordering::Relaxed);
+                        if state & WRITE != 0 && state & READ == 0 {
+                            ptr::drop_in_place((*slot.value.get()).as_mut_ptr());
                         }
                     }
                 }
 
-                drop(Box::from_raw(block)); // deallocate block
+                Block::dealloc(block);
                 block = next;
             }
 
-            // 2. Release blocks in the free list
-            while let Some(b) = inner.free_list.pop() {
-                drop(Box::from_raw(b));
+            for b in inner.free_list.drain_all() {
+                Block::dealloc(b);
             }
 
-            // 3. Deallocate InnerVec itself
+            for entry_ptr in inner.recycle_queue.drain_all() {
+                let entry = Box::from_raw(entry_ptr);
+                Block::dealloc(entry.block);
+            }
+
             drop(Box::from_raw(self.inner as *mut InnerVec<T>));
         }
     }
 }
 
 impl<T> FromIterator<T> for AtomicVec<T> {
-    /// Creates an AtomicVec from an iterator of items.
-    /// This method pushes items one by one.
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let vec = Self::new();
-        for item in iter {
-            vec.push(item);
-        }
+        vec.push_batch(iter);
         vec
     }
 }
 
 impl<T> Default for AtomicVec<T> {
-    /// Creates a new empty AtomicVec
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for AtomicVec<T> {
-    /// Implements Debug for AtomicVec.
-    /// Displays the current length and capacity.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AtomicVec")
             .field("len", &self.len())
@@ -574,3 +1190,6 @@ impl<T: fmt::Debug> fmt::Debug for AtomicVec<T> {
             .finish()
     }
 }
+
+unsafe impl<T: Send> Send for RecycleEntry<T> {}
+unsafe impl<T: Send> Sync for RecycleEntry<T> {}

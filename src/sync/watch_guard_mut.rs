@@ -129,29 +129,3 @@ impl<'a, T: Debug> Debug for WatchGuardMut<'a, T> {
             .finish()
     }
 }
-
-#[cfg(test)]
-mod tests_watch_guard_mut {
-    use super::*;
-    use crate::sync::RwLock;
-    #[test]
-    fn test_cast() {
-        let lock = RwLock::new(Box::new(String::from("hello")) as Box<dyn Any>);
-
-        let guard = lock.lock_exclusive();
-        unsafe {
-            let mut t_str = WatchGuardMut::downcast::<String>(guard).unwrap();
-            t_str.push_str(":hello");
-            assert_eq!(t_str, "hello:hello");
-        }
-
-        let guard = lock.lock_exclusive();
-        unsafe {
-            let mut t_str = WatchGuardMut::downcast::<String>(guard).unwrap();
-            t_str.push_str(":hello");
-            assert_eq!(t_str, "hello:hello:hello");
-        }
-
-        drop(lock);
-    }
-}

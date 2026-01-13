@@ -1,107 +1,70 @@
 use crate::core::futex::{futex_wait, futex_wake, futex_wake_all};
 use crate::core::smutex::SGuard;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) struct SCondVar {
-    waiters: AtomicUsize,
+    pub(crate) epoch: AtomicUsize,
 }
 
 impl SCondVar {
     #[inline]
     pub(crate) const fn new() -> Self {
         Self {
-            waiters: AtomicUsize::new(0),
+            epoch: AtomicUsize::new(0),
         }
     }
 
+    /// Wait on the condition variable.
+    ///
+    /// This atomically unlocks the mutex, waits for a notification,
+    /// and re-locks the mutex before returning.
     pub(crate) fn wait<'a>(&self, guard: SGuard<'a>) -> SGuard<'a> {
+        // Capture guard info before forgetting it
+        let mutex = guard.m;
+        let is_group = guard.is_group;
+
+        // Prevent double-unlock: forget the guard so Drop doesn't run
+        std::mem::forget(guard);
+
         loop {
-            let futex_value = self.waiters.load(Ordering::Acquire);
+            let current_epoch = self.epoch.load(Ordering::Acquire);
 
-            // Unlock the sync before going to sleep.
-            SGuard::unlock(&guard);
-
-            // Wait, but only if there hasn't been any
-            // notification since we unlocked the sync.
-            futex_wait(&self.waiters, futex_value);
-
-            // Lock the sync again.
-            SGuard::lock(&guard);
-
-            // se epoch è cambiato → notifica ricevuta
-            if self.waiters.load(Ordering::Acquire) != futex_value {
-                break;
+            // Unlock the mutex before sleeping
+            if is_group {
+                mutex.raw_unlock_group();
+            } else {
+                mutex.raw_unlock();
             }
-        }
 
-        guard
+            // Wait for notification (spurious wakeups possible)
+            futex_wait(&self.epoch, current_epoch);
+
+            // Re-lock the mutex
+            let new_guard = if is_group {
+                mutex.lock_group()
+            } else {
+                mutex.lock()
+            };
+
+            // Check if epoch changed (real notification vs spurious wakeup)
+            if self.epoch.load(Ordering::Acquire) != current_epoch {
+                return new_guard;
+            }
+
+            // Spurious wakeup - forget guard and retry
+            std::mem::forget(new_guard);
+        }
     }
 
-    // All the memory orderings here are `Relaxed`,
-    // because synchronization is done by unlocking and locking the sync.
+    /// Wake one waiting thread.
     pub(crate) fn notify_one(&self) {
-        self.waiters.fetch_add(1, Relaxed);
-        futex_wake(&self.waiters);
+        self.epoch.fetch_add(1, Ordering::Release);
+        futex_wake(&self.epoch);
     }
 
+    /// Wake all waiting threads.
     pub(crate) fn notify_all(&self) {
-        self.waiters.fetch_add(1, Relaxed);
-        futex_wake_all(&self.waiters);
-    }
-}
-
-#[cfg(test)]
-mod tests_scondvar {
-    use super::*;
-    use crate::core::smutex::SMutex;
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn test_notify_one() {
-        let mutex = Arc::new(SMutex::new());
-        let condvar = Arc::new(SCondVar::new());
-
-        let m = mutex.clone();
-        let cv = condvar.clone();
-
-        let handle = thread::spawn(move || {
-            let m = m.lock();
-            cv.wait(m);
-            42
-        });
-
-        thread::sleep(Duration::from_millis(50));
-
-        condvar.notify_one();
-
-        let result = handle.join().unwrap();
-        assert_eq!(result, 42);
-    }
-
-    #[test]
-    fn test_notify_all() {
-        let mutex = Arc::new(SMutex::new());
-        let condvar = Arc::new(SCondVar::new());
-
-        let mut handles = vec![];
-        for _ in 0..3 {
-            let m = mutex.clone();
-            let cv = condvar.clone();
-            handles.push(thread::spawn(move || {
-                let m = m.lock();
-                cv.wait(m);
-                1
-            }));
-        }
-
-        thread::sleep(Duration::from_millis(50));
-
-        condvar.notify_all();
-
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(results, vec![1, 1, 1]);
+        self.epoch.fetch_add(1, Ordering::Release);
+        futex_wake_all(&self.epoch);
     }
 }

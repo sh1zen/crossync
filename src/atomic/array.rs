@@ -267,32 +267,41 @@ impl<T> AtomicArray<T> {
         let inner_ptr = self.inner as *mut InnerArray<T>;
         let inner = unsafe { &mut *inner_ptr };
         let old_capacity = inner.capacity;
+        let old_len = inner.len.load(Ordering::Acquire);
+        let old_head = inner.head.load(Ordering::Acquire);
         let old_slots = inner.slots;
 
-        // Lock all old slots exclusively
+        // Lock e drop dei vecchi valori
         unsafe {
-            for i in 0..old_capacity {
-                let slot = &*old_slots.add(i);
-                if slot.is_written() {
-                    slot.wait_write();
-                    slot.lock.lock_exclusive();
+            if mem::needs_drop::<T>() {
+                for i in 0..old_len {
+                    let idx = old_head + i;
+                    if idx < old_capacity {
+                        let slot = &*old_slots.add(idx);
+                        if slot.is_written() {
+                            slot.lock.lock_exclusive();
+                            // FIX: drop il valore T, non MaybeUninit<T>
+                            ptr::drop_in_place((*slot.value.get()).as_mut_ptr());
+                            slot.lock.unlock_exclusive();
+                        }
+                    }
                 }
-            }
-        }
-
-        // Drop old values if necessary
-        if mem::needs_drop::<T>() {
-            unsafe {
-                for i in 0..old_capacity {
-                    let slot = &*old_slots.add(i);
-                    if slot.is_written() {
-                        ptr::drop_in_place(slot.value.get());
+            } else {
+                // Anche senza drop, dobbiamo lockare per sicurezza
+                for i in 0..old_len {
+                    let idx = old_head + i;
+                    if idx < old_capacity {
+                        let slot = &*old_slots.add(idx);
+                        if slot.is_written() {
+                            slot.lock.lock_exclusive();
+                            slot.lock.unlock_exclusive();
+                        }
                     }
                 }
             }
         }
 
-        // Deallocate old slots
+        // Dealloca vecchi slot
         unsafe {
             for i in 0..old_capacity {
                 ptr::drop_in_place(old_slots.add(i));
@@ -301,16 +310,16 @@ impl<T> AtomicArray<T> {
                 old_capacity * mem::size_of::<Slot<T>>(),
                 mem::align_of::<Slot<T>>(),
             )
-            .expect("Failed to create layout");
+                .expect("Failed to create layout");
             std::alloc::dealloc(old_slots as *mut u8, old_layout);
         }
 
-        // Allocate new slots
+        // Alloca nuovi slot
         let layout = std::alloc::Layout::from_size_align(
             new_cap * mem::size_of::<Slot<T>>(),
             mem::align_of::<Slot<T>>(),
         )
-        .expect("Failed to create layout");
+            .expect("Failed to create layout");
 
         let slots = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout) as *mut Slot<T>;
@@ -323,24 +332,25 @@ impl<T> AtomicArray<T> {
             ptr
         };
 
+        // Aggiorna inner
         inner.slots = slots;
         inner.capacity = new_cap;
-        inner.head.store(0, Ordering::Relaxed);
-        inner.tail.store(0, Ordering::Relaxed);
-        inner.len.store(0, Ordering::Relaxed);
+        inner.head.store(0, Ordering::Release);
+        inner.tail.store(0, Ordering::Release);
+        inner.len.store(0, Ordering::Release);
 
-        // Initialize new values
-        let inner_immut = unsafe { &*inner_ptr };
+        // Inizializza nuovi valori
         for i in 0..new_cap {
             let value = initializer();
             unsafe {
-                let slot = &*inner_immut.slots.add(i);
+                let slot = &*inner.slots.add(i);
                 ptr::write(slot.value.get(), MaybeUninit::new(value));
                 slot.state.store(WRITE, Ordering::Release);
             }
-            inner_immut.tail.store(i + 1, Ordering::Relaxed);
-            inner_immut.len.store(i + 1, Ordering::Relaxed);
         }
+
+        inner.tail.store(new_cap, Ordering::Release);
+        inner.len.store(new_cap, Ordering::Release);
 
         Ok(new_cap)
     }
@@ -452,29 +462,37 @@ impl<T> Drop for AtomicArray<T> {
         }
         fence(Ordering::Acquire);
 
-        // Drop all values if necessary
         unsafe {
+            // Drop dei valori contenuti
             if mem::needs_drop::<T>() {
-                for i in 0..inner.capacity {
-                    let slot = &*inner.slots.add(i);
-                    if slot.is_written() {
-                        ptr::drop_in_place(slot.value.get());
+                let len = inner.len.load(Ordering::Acquire);
+                let head = inner.head.load(Ordering::Acquire);
+                for i in 0..len {
+                    let idx = head + i;
+                    if idx < inner.capacity {
+                        let slot = &*inner.slots.add(idx);
+                        if slot.is_written() {
+                            // FIX: drop il valore T, non MaybeUninit<T>
+                            ptr::drop_in_place((*slot.value.get()).as_mut_ptr());
+                        }
                     }
                 }
             }
 
-            // Drop slots
+            // Drop degli slot (RawMutex, AtomicUsize, etc.)
             for i in 0..inner.capacity {
                 ptr::drop_in_place(inner.slots.add(i));
             }
 
+            // Dealloca memoria slot
             let layout = std::alloc::Layout::from_size_align(
                 inner.capacity * mem::size_of::<Slot<T>>(),
                 mem::align_of::<Slot<T>>(),
             )
-            .expect("Failed to create layout");
+                .expect("Failed to create layout");
             std::alloc::dealloc(inner.slots as *mut u8, layout);
 
+            // Drop InnerArray
             drop(Box::from_raw(self.inner as *mut InnerArray<T>));
         }
     }

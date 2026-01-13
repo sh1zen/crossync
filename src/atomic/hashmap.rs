@@ -330,23 +330,23 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
     {
         let hash = self.hash(key);
         let idx = self.determine_shard(hash);
-        let shard = self.inner().shards[idx].lock_shared(); // prendi solo per trovare lo slot
+        let shard = self.inner().shards[idx].lock_shared();
         let slot = shard.get_slot(hash);
 
-        // Acquisisci il lock sullo slot
         slot.mutex.lock_shared();
 
         let mut cur = slot.head.load(Ordering::Acquire);
         while !cur.is_null() {
             unsafe {
                 if (*cur).hash == hash && (*cur).key.borrow() == key {
-                    // Creiamo un WatchGuardRef solo con il lock del slot
+                    // Pass a raw pointer to the mutex, not a clone
                     return Some(WatchGuardRef::new(&(*cur).value, slot.mutex.clone()));
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
             }
         }
 
+        slot.mutex.unlock_shared();
         None
     }
 

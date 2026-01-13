@@ -114,6 +114,12 @@ impl<T> Drop for RwLock<T> {
     }
 }
 
+impl<T: Default> Default for RwLock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
 impl<T: Debug> Debug for RwLock<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let locked = self.try_lock();

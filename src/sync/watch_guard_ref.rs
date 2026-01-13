@@ -122,25 +122,3 @@ impl<'a, T: Debug> Debug for WatchGuardRef<'a, T> {
             .finish()
     }
 }
-
-#[cfg(test)]
-mod tests_watch_guard_ref {
-    use super::*;
-    use crate::sync::RwLock;
-    #[test]
-    fn test_cast() {
-        let lock = RwLock::new(Box::new(String::from("hello")) as Box<dyn Any>);
-
-        let guard = lock.lock_shared();
-        unsafe {
-            let t_str = WatchGuardRef::downcast::<String>(guard).unwrap();
-            assert_eq!(t_str, "hello");
-        }
-
-        let guard = lock.lock_shared();
-        unsafe {
-            let t_str = WatchGuardRef::downcast::<String>(guard).unwrap();
-            assert_eq!(t_str, "hello");
-        }
-    }
-}

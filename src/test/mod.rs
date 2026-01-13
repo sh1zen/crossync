@@ -1,6 +1,5 @@
-mod array;
-mod buffer;
-mod map;
-mod mpmc;
-mod mutex;
-mod vec;
+mod atomic;
+mod channels;
+mod core;
+mod lock_free;
+mod sync;
