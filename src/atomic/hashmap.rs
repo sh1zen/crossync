@@ -340,7 +340,7 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
             unsafe {
                 if (*cur).hash == hash && (*cur).key.borrow() == key {
                     // Pass a raw pointer to the mutex, not a clone
-                    return Some(WatchGuardRef::new(&(*cur).value, slot.mutex.clone()));
+                    return Some(WatchGuardRef::new(&(*cur).value, &slot.mutex));
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
             }
@@ -348,6 +348,14 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
 
         slot.mutex.unlock_shared();
         None
+    }
+
+    pub fn with<Q: ?Sized, R>(&self, key: &Q, f: impl FnOnce(&V) -> R) -> Option<R>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.get(key).map(|guard| f(&guard))
     }
 
     pub fn get_mut<Q: ?Sized>(&self, key: &Q) -> Option<WatchGuardMut<'_, V>>
@@ -365,7 +373,7 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
         while !cur.is_null() {
             unsafe {
                 if (*cur).hash == hash && (*cur).key.borrow() == key {
-                    return Some(WatchGuardMut::new(&mut *(*cur).value, slot.mutex.clone()));
+                    return Some(WatchGuardMut::new(&mut *(*cur).value, &slot.mutex));
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
             }
@@ -373,6 +381,14 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
 
         slot.mutex.unlock_exclusive();
         None
+    }
+
+    pub fn with_mut<Q: ?Sized, R>(&self, key: &Q, f: impl FnOnce(&mut V) -> R) -> Option<R>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.get_mut(key).map(|mut guard| f(&mut guard))
     }
 
     pub fn remove<Q: ?Sized>(&self, key: &Q) -> Option<V>

@@ -85,6 +85,38 @@ mod tests_rwlock {
         assert!(lock.try_lock().is_none());
     }
 
+    #[test]
+    fn test_with_exclusive() {
+        let lock = RwLock::new(vec![1, 2, 3]);
+
+        let len = lock.with_exclusive(|value| {
+            value.push(4);
+            value.len()
+        });
+
+        assert_eq!(len, 4);
+        assert_eq!(lock.with_shared(|value| value.clone()), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_try_with_exclusive() {
+        let lock = RwLock::new(10);
+
+        assert_eq!(
+            lock.try_with_exclusive(|value| {
+                *value += 5;
+                *value
+            }),
+            Some(15)
+        );
+
+        let shared = lock.lock_shared();
+        assert_eq!(lock.try_with_exclusive(|value| *value), None);
+        drop(shared);
+
+        assert_eq!(lock.with_shared(|value| *value), 15);
+    }
+
     // ==================== SHARED LOCKING ====================
 
     #[test]
@@ -134,6 +166,25 @@ mod tests_rwlock {
 
         let _guard = lock.lock_exclusive();
         assert!(lock.try_lock_shared().is_none());
+    }
+
+    #[test]
+    fn test_with_shared() {
+        let lock = RwLock::new(String::from("hello"));
+
+        assert_eq!(lock.with_shared(|value| value.len()), 5);
+        assert_eq!(lock.with_shared(|value| value.clone()), "hello");
+    }
+
+    #[test]
+    fn test_try_with_shared() {
+        let lock = RwLock::new(42);
+
+        assert_eq!(lock.try_with_shared(|value| *value), Some(42));
+
+        let exclusive = lock.lock_exclusive();
+        assert_eq!(lock.try_with_shared(|value| *value), None);
+        drop(exclusive);
     }
 
     // ==================== LOCK STATE ====================

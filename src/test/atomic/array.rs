@@ -1,8 +1,9 @@
 mod tests_atomic_array {
     use crate::atomic::AtomicArray;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     // ==================== TRACKED WRAPPER ====================
 
@@ -140,6 +141,28 @@ mod tests_atomic_array {
         assert!(arr.get_mut(2).is_none());
     }
 
+    #[test]
+    fn test_with() {
+        let arr = AtomicArray::from_iter(vec![10, 20, 30]);
+
+        assert_eq!(arr.with(1, |value| *value), Some(20));
+        assert_eq!(arr.with(10, |value| *value), None);
+    }
+
+    #[test]
+    fn test_with_mut() {
+        let arr = AtomicArray::from_iter(vec![10, 20, 30]);
+
+        let updated = arr.with_mut(1, |value| {
+            *value += 5;
+            *value
+        });
+
+        assert_eq!(updated, Some(25));
+        assert_eq!(arr.with(1, |value| *value), Some(25));
+        assert_eq!(arr.with_mut(10, |value| *value), None);
+    }
+
     // ==================== RESET_WITH ====================
 
     #[test]
@@ -158,6 +181,132 @@ mod tests_atomic_array {
     fn test_reset_with_zero_panics() {
         let arr: AtomicArray<i32> = AtomicArray::new();
         let _ = arr.reset_with(0, || 0);
+    }
+
+    #[test]
+    fn test_reset_with_waits_for_live_guard() {
+        let arr = Arc::new(AtomicArray::from_iter(0..4));
+        let guard_ready = Arc::new(Barrier::new(2));
+        let release_guard = Arc::new(AtomicBool::new(false));
+        let reset_done = Arc::new(AtomicBool::new(false));
+
+        let reader_arr = arr.clone();
+        let reader_ready = guard_ready.clone();
+        let reader_release = release_guard.clone();
+        let reader = thread::spawn(move || {
+            let guard = reader_arr.get(0).unwrap();
+            reader_ready.wait();
+            while !reader_release.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            drop(guard);
+        });
+
+        guard_ready.wait();
+
+        let reset_arr = arr.clone();
+        let done = reset_done.clone();
+        let resetter = thread::spawn(move || {
+            reset_arr.reset_with(4, || 99).unwrap();
+            done.store(true, Ordering::Release);
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !reset_done.load(Ordering::Acquire),
+            "reset_with completed while a slot guard was still alive"
+        );
+
+        release_guard.store(true, Ordering::Release);
+        reader.join().unwrap();
+        resetter.join().unwrap();
+
+        assert_eq!(arr.as_vec(), vec![99; 4]);
+    }
+
+    #[test]
+    fn test_reset_with_concurrent_accessors_and_push() {
+        let arr = Arc::new(AtomicArray::from_iter(0..32));
+        let start = Arc::new(Barrier::new(7));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let reset_arr = arr.clone();
+        let reset_start = start.clone();
+        let reset_done = done.clone();
+        let resetter = thread::spawn(move || {
+            reset_start.wait();
+            for round in 0..64 {
+                reset_arr.reset_with(32, || round).unwrap();
+                thread::yield_now();
+            }
+            reset_done.store(true, Ordering::Release);
+        });
+
+        let get_arr = arr.clone();
+        let get_start = start.clone();
+        let get_done = done.clone();
+        let getter = thread::spawn(move || {
+            get_start.wait();
+            while !get_done.load(Ordering::Acquire) {
+                if let Some(guard) = get_arr.get(0) {
+                    let _ = *guard;
+                }
+            }
+        });
+
+        let get_mut_arr = arr.clone();
+        let get_mut_start = start.clone();
+        let get_mut_done = done.clone();
+        let mutator = thread::spawn(move || {
+            get_mut_start.wait();
+            while !get_mut_done.load(Ordering::Acquire) {
+                if let Some(mut guard) = get_mut_arr.get_mut(0) {
+                    *guard += 1;
+                }
+            }
+        });
+
+        let as_vec_arr = arr.clone();
+        let as_vec_start = start.clone();
+        let as_vec_done = done.clone();
+        let snapshotter = thread::spawn(move || {
+            as_vec_start.wait();
+            while !as_vec_done.load(Ordering::Acquire) {
+                let _ = as_vec_arr.as_vec();
+            }
+        });
+
+        let for_each_arr = arr.clone();
+        let for_each_start = start.clone();
+        let for_each_done = done.clone();
+        let iterator = thread::spawn(move || {
+            for_each_start.wait();
+            while !for_each_done.load(Ordering::Acquire) {
+                for_each_arr.for_each(|_| {});
+            }
+        });
+
+        let push_arr = arr.clone();
+        let push_start = start.clone();
+        let push_done = done.clone();
+        let pusher = thread::spawn(move || {
+            push_start.wait();
+            while !push_done.load(Ordering::Acquire) {
+                let _ = push_arr.push(1234);
+            }
+        });
+
+        start.wait();
+
+        resetter.join().unwrap();
+        getter.join().unwrap();
+        mutator.join().unwrap();
+        snapshotter.join().unwrap();
+        iterator.join().unwrap();
+        pusher.join().unwrap();
+
+        assert_eq!(arr.len(), 32);
+        assert_eq!(arr.capacity(), 32);
     }
 
     // ==================== AS_VEC ====================

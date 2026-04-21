@@ -51,24 +51,41 @@ impl<T> RwLock<T> {
     pub fn lock_exclusive(&self) -> WatchGuardMut<'_, T> {
         let inner = self.inner();
         inner.mutex.lock_exclusive();
-        WatchGuardMut::new(inner.data.get(), inner.mutex.clone())
+        WatchGuardMut::new(inner.data.get(), &inner.mutex)
+    }
+
+    /// Executes a closure while holding the lock exclusively.
+    pub fn with_exclusive<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut guard = self.lock_exclusive();
+        f(&mut guard)
     }
 
     /// Try acquiring exclusive lock
     pub fn try_lock(&self) -> Option<WatchGuardMut<'_, T>> {
         let inner = self.inner();
         if inner.mutex.try_lock_exclusive() {
-            Some(WatchGuardMut::new(inner.data.get(), inner.mutex.clone()))
+            Some(WatchGuardMut::new(inner.data.get(), &inner.mutex))
         } else {
             None
         }
+    }
+
+    /// Tries to execute a closure while holding the lock exclusively.
+    pub fn try_with_exclusive<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.try_lock().map(|mut guard| f(&mut guard))
     }
 
     /// Acquire shared lock
     pub fn lock_shared(&self) -> WatchGuardRef<'_, T> {
         let inner = self.inner();
         inner.mutex.lock_shared();
-        WatchGuardRef::new(unsafe { &*inner.data.get() }, inner.mutex.clone())
+        WatchGuardRef::new(unsafe { &*inner.data.get() }, &inner.mutex)
+    }
+
+    /// Executes a closure while holding the lock in shared mode.
+    pub fn with_shared<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let guard = self.lock_shared();
+        f(&guard)
     }
 
     /// Try acquiring shared lock
@@ -77,11 +94,16 @@ impl<T> RwLock<T> {
         if inner.mutex.try_lock_shared() {
             Some(WatchGuardRef::new(
                 unsafe { &*inner.data.get() },
-                inner.mutex.clone(),
+                &inner.mutex,
             ))
         } else {
             None
         }
+    }
+
+    /// Tries to execute a closure while holding the lock in shared mode.
+    pub fn try_with_shared<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        self.try_lock_shared().map(|guard| f(&guard))
     }
 
     pub fn is_locked(&self) -> bool {

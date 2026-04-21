@@ -313,6 +313,14 @@ impl<T> AtomicVec<T> {
     #[inline]
     unsafe fn acquire_block(&self) -> *mut Block<T> {
         let inner = self.inner();
+        if let Some(block) = inner.free_list.pop() {
+            return block;
+        }
+
+        unsafe {
+            self.try_process_recycles();
+        }
+
         inner.free_list.pop().unwrap_or_else(Block::<T>::new)
     }
 
@@ -338,7 +346,6 @@ impl<T> AtomicVec<T> {
     pub fn push(&self, value: T) {
         unsafe {
             let inner = self.inner();
-            self.try_process_recycles();
 
             let backoff = Backoff::new();
             let mut tail = inner.tail.index.load(Ordering::Acquire);

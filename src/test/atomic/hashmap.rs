@@ -73,6 +73,30 @@ mod tests_atomic_hashmap {
     }
 
     #[test]
+    fn test_with() {
+        let map = AtomicHashMap::new();
+        map.insert("x", vec![1, 2, 3]);
+
+        assert_eq!(map.with("x", |value| value.len()), Some(3));
+        assert_eq!(map.with("missing", |value: &Vec<i32>| value.len()), None);
+    }
+
+    #[test]
+    fn test_with_mut() {
+        let map = AtomicHashMap::new();
+        map.insert("x", vec![1, 2, 3]);
+
+        let len = map.with_mut("x", |value| {
+            value.push(4);
+            value.len()
+        });
+
+        assert_eq!(len, Some(4));
+        assert_eq!(map.with("x", |value| value.clone()), Some(vec![1, 2, 3, 4]));
+        assert_eq!(map.with_mut("missing", |value: &mut Vec<i32>| value.len()), None);
+    }
+
+    #[test]
     fn test_contains_and_iteration() {
         let map = AtomicHashMap::with_capacity(8);
         for i in 0..100 {

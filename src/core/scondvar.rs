@@ -1,20 +1,39 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::core::futex::{futex_wait, futex_wake, futex_wake_all};
 use crate::core::smutex::SGuard;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
-pub(crate) struct SCondVar {
+pub struct SCondVar {
     futex: AtomicUsize,  // For futex_wait/wake
     pub(crate) waiters: AtomicUsize,
     pub(crate) to_wake: AtomicUsize,
 }
 
 impl SCondVar {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             futex: AtomicUsize::new(0),
             waiters: AtomicUsize::new(0),
             to_wake: AtomicUsize::new(0),
         }
+    }
+
+    pub fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::yield_now();
+        }
+    }
+
+    pub fn wait_for_waiters(&self, count: usize, timeout: Duration) -> bool {
+        Self::wait_until(timeout, || self.waiters.load(Ordering::Acquire) >= count)
     }
 
     pub(crate) fn wait<'a>(&self, guard: SGuard<'a>) -> SGuard<'a> {
@@ -61,7 +80,7 @@ impl SCondVar {
         }
     }
 
-    pub(crate) fn notify_one(&self) {
+    pub fn notify_one(&self) {
         if self.waiters.load(Ordering::SeqCst) > 0 {
             self.to_wake.fetch_add(1, Ordering::Release);
             self.futex.fetch_add(1, Ordering::Release);
@@ -69,7 +88,7 @@ impl SCondVar {
         }
     }
 
-    pub(crate) fn notify_all(&self) {
+    pub fn notify_all(&self) {
         let waiters = self.waiters.load(Ordering::SeqCst);
         if waiters > 0 {
             self.to_wake.fetch_add(waiters, Ordering::Release);

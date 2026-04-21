@@ -1,3 +1,4 @@
+use crate::sync::Backoff;
 use crossbeam_utils::CachePadded;
 use std::ptr;
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
@@ -87,6 +88,7 @@ impl<T> AtomicBuffer<T> {
             // Ora abbiamo riservato slot[tail]
             let idx = tail & inner.cap_mask;
             let slot = unsafe { self.slot_unchecked(idx) };
+            let backoff = Backoff::new();
 
             // Scrivi il valore (lo slot potrebbe non essere ancora vuoto
             // se un consumer è lento)
@@ -98,7 +100,7 @@ impl<T> AtomicBuffer<T> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => return Ok(()),
-                    Err(_) => core::hint::spin_loop(),
+                    Err(_) => backoff.snooze(),
                 }
             }
         }
@@ -128,6 +130,7 @@ impl<T> AtomicBuffer<T> {
 
             let idx = head & inner.cap_mask;
             let slot = unsafe { self.slot_unchecked(idx) };
+            let backoff = Backoff::new();
 
             // Leggi il valore (potrebbe non essere ancora scritto)
             loop {
@@ -135,7 +138,7 @@ impl<T> AtomicBuffer<T> {
                 if !val.is_null() {
                     return Some(val);
                 }
-                core::hint::spin_loop();
+                backoff.snooze();
             }
         }
     }

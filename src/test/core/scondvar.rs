@@ -1,10 +1,21 @@
 mod tests_scondvar {
     use crate::core::scondvar::SCondVar;
     use crate::core::smutex::SMutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn wait_for_waiters(condvar: &SCondVar, count: usize) {
+        assert!(
+            condvar.wait_for_waiters(count, WAIT_TIMEOUT),
+            "expected at least {} waiter(s), found {}",
+            count,
+            condvar.waiters.load(Ordering::Acquire)
+        );
+    }
 
     struct TestCtx {
         mutex: Arc<SMutex>,
@@ -40,7 +51,7 @@ mod tests_scondvar {
             42
         });
 
-        thread::sleep(Duration::from_millis(30));
+        wait_for_waiters(&ctx.condvar, 1);
         assert!(!woke_up.load(Ordering::Acquire), "Should still be waiting");
 
         ctx.condvar.notify_one();
@@ -69,23 +80,20 @@ mod tests_scondvar {
             })
             .collect();
 
-        // Wait until all threads are in wait state
-        while waiting_count.load(Ordering::Acquire) < N {
-            thread::yield_now();
-        }
-        // Extra yields to ensure they've entered futex_wait
-        for _ in 0..100 {
-            thread::yield_now();
-        }
+        assert!(
+            SCondVar::wait_until(WAIT_TIMEOUT, || waiting_count.load(Ordering::Acquire) == N),
+            "not all waiters reached the wait path"
+        );
+        wait_for_waiters(&ctx.condvar, N);
 
         assert_eq!(wake_count.load(Ordering::Acquire), 0);
 
         ctx.condvar.notify_one();
 
-        // Wait for exactly one to wake
-        while wake_count.load(Ordering::Acquire) < 1 {
-            thread::yield_now();
-        }
+        assert!(
+            SCondVar::wait_until(WAIT_TIMEOUT, || wake_count.load(Ordering::Acquire) >= 1),
+            "notify_one did not wake a waiter"
+        );
 
         // Give some time to see if more than one wakes (shouldn't happen)
         for _ in 0..100 {
@@ -122,7 +130,7 @@ mod tests_scondvar {
             })
             .collect();
 
-        thread::sleep(Duration::from_millis(50));
+        wait_for_waiters(&ctx.condvar, N);
         ctx.condvar.notify_all();
 
         for h in handles {
@@ -178,7 +186,7 @@ mod tests_scondvar {
             true
         });
 
-        thread::sleep(Duration::from_millis(30));
+        wait_for_waiters(&ctx.condvar, 1);
         ctx.condvar.notify_one();
         assert!(handle.join().unwrap());
     }
@@ -208,19 +216,20 @@ mod tests_scondvar {
 
         for i in 0..CYCLES {
             // Wait until thread signals it's about to call wait()
-            while ready_to_wait.load(Ordering::Acquire) <= i {
-                thread::yield_now();
-            }
-            // Extra yields to ensure thread enters futex_wait
-            for _ in 0..50 {
-                thread::yield_now();
-            }
+            assert!(
+                SCondVar::wait_until(WAIT_TIMEOUT, || ready_to_wait.load(Ordering::Acquire) > i),
+                "waiter never reached cycle {}",
+                i
+            );
+            wait_for_waiters(&ctx.condvar, 1);
             ctx.condvar.notify_one();
 
             // Wait for thread to wake before next cycle
-            while woke_count.load(Ordering::Acquire) <= i {
-                thread::yield_now();
-            }
+            assert!(
+                SCondVar::wait_until(WAIT_TIMEOUT, || woke_count.load(Ordering::Acquire) > i),
+                "waiter never woke in cycle {}",
+                i
+            );
         }
 
         handle.join().unwrap();
@@ -240,7 +249,7 @@ mod tests_scondvar {
                 round
             });
 
-            thread::sleep(Duration::from_millis(30));
+            wait_for_waiters(&ctx.condvar, 1);
             ctx.condvar.notify_one();
             assert_eq!(handle.join().unwrap(), round);
         }
@@ -266,7 +275,7 @@ mod tests_scondvar {
             })
             .collect();
 
-        thread::sleep(Duration::from_millis(50));
+        wait_for_waiters(&ctx.condvar, N);
         ctx.condvar.notify_all();
 
         for h in handles {
@@ -295,13 +304,15 @@ mod tests_scondvar {
             })
             .collect();
 
-        thread::sleep(Duration::from_millis(100));
+        wait_for_waiters(&ctx.condvar, N);
 
         for i in 1..=N {
             ctx.condvar.notify_one();
-            while wake_count.load(Ordering::Acquire) < i {
-                thread::yield_now();
-            }
+            assert!(
+                SCondVar::wait_until(WAIT_TIMEOUT, || wake_count.load(Ordering::Acquire) >= i),
+                "waiter {} never woke",
+                i
+            );
         }
 
         for h in handles {
@@ -334,8 +345,7 @@ mod tests_scondvar {
                 })
                 .collect();
 
-            // Wait for all threads to enter wait state
-            thread::sleep(Duration::from_millis(50));
+            wait_for_waiters(&ctx.condvar, THREADS_PER_ROUND);
 
             ctx.condvar.notify_all();
 
@@ -376,7 +386,7 @@ mod tests_scondvar {
             })
             .collect();
 
-        thread::sleep(Duration::from_millis(50));
+        wait_for_waiters(&ctx.condvar, N);
 
         // Notify all at once
         for _ in 0..N {
@@ -411,7 +421,7 @@ mod tests_scondvar {
             })
             .collect();
 
-        thread::sleep(Duration::from_millis(50));
+        wait_for_waiters(&ctx.condvar, N);
 
         for _ in 0..N {
             ctx.condvar.notify_one();
@@ -463,7 +473,7 @@ mod tests_scondvar {
             true
         });
 
-        thread::sleep(Duration::from_millis(30));
+        wait_for_waiters(&ctx.condvar, 1);
         cv2.notify_one();
 
         assert!(handle.join().unwrap());
@@ -486,10 +496,11 @@ mod tests_scondvar {
             let _guard = cv.wait(guard);
         });
 
-        while !waiting.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
-        thread::sleep(Duration::from_millis(20));
+        assert!(
+            SCondVar::wait_until(WAIT_TIMEOUT, || waiting.load(Ordering::Acquire)),
+            "waiter never reached the wait path"
+        );
+        wait_for_waiters(&ctx.condvar, 1);
 
         // Should be able to acquire while waiter is blocked
         let m2 = Arc::clone(&ctx.mutex);
@@ -525,7 +536,7 @@ mod tests_scondvar {
             })
             .collect();
 
-        thread::sleep(Duration::from_millis(50));
+        wait_for_waiters(&ctx.condvar, N);
 
         // Multiple notify_all - only wakes N threads total
         ctx.condvar.notify_all();

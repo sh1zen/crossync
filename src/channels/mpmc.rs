@@ -67,19 +67,16 @@ impl<T> Mpmc<T> {
     /// Returns `Err(value)` if the buffer is full or the channel is closed.
     pub fn send(&self, value: T) -> Result<(), T> {
         let inner = self.inner();
+        let _guard = inner.mutex.lock();
 
-        // Do not accept new messages if closed
         if inner.closed.load(Ordering::Acquire) {
             return Err(value);
         }
 
-        // Check bounded capacity (if applicable)
         if inner.bounded > 0 && inner.buffer.len() >= inner.bounded {
             return Err(value);
         }
 
-        // Acquire lock for safe access
-        let _guard = inner.mutex.lock();
         inner.buffer.push(value);
 
         // Wake up one waiting receiver

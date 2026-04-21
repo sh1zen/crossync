@@ -4,13 +4,12 @@ use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
-use std::ptr;
 
 /// used as wrapper for a pointer to a reference
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct WatchGuardRef<'a, T: ?Sized> {
     data: *const T,
-    lock: RawMutex,
+    lock: *const RawMutex,
     marker: PhantomData<&'a T>,
 }
 
@@ -19,7 +18,7 @@ unsafe impl<T: ?Sized + Send> Send for WatchGuardRef<'_, T> {}
 
 impl<'mutex, T: ?Sized> WatchGuardRef<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
-    pub(crate) fn new(ptr: &'mutex T, lock: RawMutex) -> WatchGuardRef<'mutex, T> {
+    pub(crate) fn new(ptr: &'mutex T, lock: *const RawMutex) -> WatchGuardRef<'mutex, T> {
         Self {
             data: ptr,
             lock,
@@ -28,7 +27,7 @@ impl<'mutex, T: ?Sized> WatchGuardRef<'mutex, T> {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.lock.is_locked()
+        unsafe { (*self.lock).is_locked() }
     }
 }
 
@@ -74,15 +73,11 @@ impl<'mutex, T: Sized> WatchGuardRef<'mutex, T> {
         let data = unsafe { &**data };
 
         if TypeId::of::<U>() == data.type_id() {
-            // Move the lock out of the ManuallyDrop (so we don't leak/unlock twice).
-            // This performs a bitwise move of `this.lock`.
-            let lock = unsafe { ptr::read(&this.lock) };
-
             // SAFETY: We are casting from `dyn Any` to `U`.
             // Safe only because we just checked that the type IDs match.
             let data = unsafe { &*(data as *const dyn Any as *const U) };
 
-            Ok(WatchGuardRef::new(data, lock))
+            Ok(WatchGuardRef::new(data, this.lock))
         } else {
             Err(ManuallyDrop::into_inner(this))
         }
@@ -93,7 +88,9 @@ impl<T: ?Sized> Deref for WatchGuardRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        debug_assert!(self.lock.is_locked_shared(), "{:?}", self.lock);
+        debug_assert!(unsafe { (*self.lock).is_locked_shared() }, "{:?}", unsafe {
+            &*self.lock
+        });
         unsafe { &*self.data }
     }
 }
@@ -101,7 +98,7 @@ impl<T: ?Sized> Deref for WatchGuardRef<'_, T> {
 impl<T: ?Sized> Drop for WatchGuardRef<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.unlock_shared();
+        unsafe { (*self.lock).unlock_shared() };
     }
 }
 
@@ -118,7 +115,7 @@ impl<'a, T: Debug> Debug for WatchGuardRef<'a, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WatchGuardRef")
             .field("data", &self.data)
-            .field("lock", &self.lock)
+            .field("lock", &unsafe { &*self.lock })
             .finish()
     }
 }

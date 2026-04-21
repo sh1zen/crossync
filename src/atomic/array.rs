@@ -5,7 +5,7 @@ use std::fmt;
 use std::iter::FromIterator;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
 /// Default capacity for the array
 const DEFAULT_ARRAY_CAP: usize = 32;
@@ -58,13 +58,51 @@ impl<T> Slot<T> {
 }
 
 /// Internal structure representing the array
-struct InnerArray<T> {
+struct ArrayStorage<T> {
     slots: *mut Slot<T>,
     capacity: usize,
+}
+
+struct InnerArray<T> {
+    storage: UnsafeCell<ArrayStorage<T>>,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
     len: CachePadded<AtomicUsize>,
+    coord_lock: RawMutex,
     ref_count: CachePadded<AtomicUsize>,
+}
+
+struct ArrayCoordGuard<'a> {
+    lock: &'a RawMutex,
+    exclusive: bool,
+}
+
+impl<'a> ArrayCoordGuard<'a> {
+    fn shared(lock: &'a RawMutex) -> Self {
+        lock.lock_shared();
+        Self {
+            lock,
+            exclusive: false,
+        }
+    }
+
+    fn exclusive(lock: &'a RawMutex) -> Self {
+        lock.lock_exclusive();
+        Self {
+            lock,
+            exclusive: true,
+        }
+    }
+}
+
+impl Drop for ArrayCoordGuard<'_> {
+    fn drop(&mut self) {
+        if self.exclusive {
+            self.lock.unlock_exclusive();
+        } else {
+            self.lock.unlock_shared();
+        }
+    }
 }
 
 /// Thread-safe atomic array wrapper
@@ -87,30 +125,15 @@ impl<T> AtomicArray<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "Capacity must be greater than 0");
 
-        // Allocate memory for slots (cache-aligned)
-        let layout = std::alloc::Layout::from_size_align(
-            capacity * mem::size_of::<Slot<T>>(),
-            mem::align_of::<Slot<T>>(),
-        )
-        .expect("Failed to create layout");
-
-        let slots = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout) as *mut Slot<T>;
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            for i in 0..capacity {
-                ptr.add(i).write(Slot::new());
-            }
-            ptr
-        };
-
         let inner = InnerArray {
-            slots,
-            capacity,
+            storage: UnsafeCell::new(ArrayStorage {
+                slots: Self::allocate_slots(capacity),
+                capacity,
+            }),
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
             len: CachePadded::new(AtomicUsize::new(0)),
+            coord_lock: RawMutex::new(),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
         };
 
@@ -134,8 +157,43 @@ impl<T> AtomicArray<T> {
     }
 
     #[inline(always)]
+    unsafe fn storage(inner: &InnerArray<T>) -> &ArrayStorage<T> {
+        unsafe { &*inner.storage.get() }
+    }
+
+    fn allocate_slots(capacity: usize) -> *mut Slot<T> {
+        let layout = std::alloc::Layout::from_size_align(
+            capacity * mem::size_of::<Slot<T>>(),
+            mem::align_of::<Slot<T>>(),
+        )
+        .expect("Failed to create layout");
+
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut Slot<T>;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            for i in 0..capacity {
+                ptr.add(i).write(Slot::new());
+            }
+            ptr
+        }
+    }
+
+    unsafe fn deallocate_slots(slots: *mut Slot<T>, capacity: usize) {
+        let layout = std::alloc::Layout::from_size_align(
+            capacity * mem::size_of::<Slot<T>>(),
+            mem::align_of::<Slot<T>>(),
+        )
+        .expect("Failed to create layout");
+        unsafe {
+            std::alloc::dealloc(slots as *mut u8, layout);
+        }
+    }
+
+    #[inline(always)]
     pub fn len(&self) -> usize {
-        self.inner().len.load(Ordering::Acquire)
+        self.inner().len.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
@@ -145,15 +203,19 @@ impl<T> AtomicArray<T> {
 
     #[inline(always)]
     pub fn capacity(&self) -> usize {
-        self.inner().capacity
+        let inner = self.inner();
+        let _coord = ArrayCoordGuard::shared(&inner.coord_lock);
+        unsafe { Self::storage(inner).capacity }
     }
 
     /// Push a new element (fast path)
     #[inline]
     pub fn push(&self, value: T) -> Result<(), T> {
         let inner = self.inner();
+        let _coord = ArrayCoordGuard::shared(&inner.coord_lock);
+        let storage = unsafe { Self::storage(inner) };
         let tail = inner.tail.load(Ordering::Relaxed);
-        if tail >= inner.capacity {
+        if tail >= storage.capacity {
             return Err(value);
         }
 
@@ -163,26 +225,26 @@ impl<T> AtomicArray<T> {
             .is_ok()
         {
             unsafe {
-                let slot = &*inner.slots.add(tail);
+                let slot = &*storage.slots.add(tail);
                 ptr::write(slot.value.get(), MaybeUninit::new(value));
                 slot.state.store(WRITE, Ordering::Release);
-                inner.len.fetch_add(1, Ordering::Release);
+                inner.len.fetch_add(1, Ordering::Relaxed);
             }
             return Ok(());
         }
 
-        self.push_slow(value)
+        self.push_slow(inner, value)
     }
 
     /// Slow path push using backoff
     #[cold]
-    fn push_slow(&self, value: T) -> Result<(), T> {
-        let inner = self.inner();
+    fn push_slow(&self, inner: &InnerArray<T>, value: T) -> Result<(), T> {
         let backoff = Backoff::new();
         let mut tail = inner.tail.load(Ordering::Relaxed);
+        let storage = unsafe { Self::storage(inner) };
 
         loop {
-            if tail >= inner.capacity {
+            if tail >= storage.capacity {
                 return Err(value);
             }
             match inner
@@ -191,10 +253,10 @@ impl<T> AtomicArray<T> {
             {
                 Ok(_) => {
                     unsafe {
-                        let slot = &*inner.slots.add(tail);
+                        let slot = &*storage.slots.add(tail);
                         ptr::write(slot.value.get(), MaybeUninit::new(value));
                         slot.state.store(WRITE, Ordering::Release);
-                        inner.len.fetch_add(1, Ordering::Release);
+                        inner.len.fetch_add(1, Ordering::Relaxed);
                     }
                     return Ok(());
                 }
@@ -210,50 +272,64 @@ impl<T> AtomicArray<T> {
     #[inline]
     pub fn get(&self, index: usize) -> Option<WatchGuardRef<'_, T>> {
         let inner = self.inner();
-        let len = inner.len.load(Ordering::Acquire);
+        let coord = ArrayCoordGuard::shared(&inner.coord_lock);
+        let storage = unsafe { Self::storage(inner) };
+        let len = inner.len.load(Ordering::Relaxed);
         if index >= len {
             return None;
         }
 
-        let target = inner.head.load(Ordering::Acquire) + index;
-        if target >= inner.capacity {
+        let target = inner.head.load(Ordering::Relaxed) + index;
+        if target >= storage.capacity {
             return None;
         }
 
         unsafe {
-            let slot = &*inner.slots.add(target);
+            let slot = &*storage.slots.add(target);
             slot.wait_write();
             slot.lock.lock_shared();
-            Some(WatchGuardRef::new(
-                (*slot.value.get()).assume_init_ref(),
-                slot.lock.clone(),
-            ))
+            let guard = WatchGuardRef::new((*slot.value.get()).assume_init_ref(), &slot.lock);
+            drop(coord);
+            Some(guard)
         }
+    }
+
+    /// Executes a closure while holding a shared guard on the element at `index`.
+    #[inline]
+    pub fn with<R>(&self, index: usize, f: impl FnOnce(&T) -> R) -> Option<R> {
+        self.get(index).map(|guard| f(&guard))
     }
 
     /// Access element by index (mutable/exclusive)
     #[inline]
     pub fn get_mut(&self, index: usize) -> Option<WatchGuardMut<'_, T>> {
         let inner = self.inner();
-        let len = inner.len.load(Ordering::Acquire);
+        let coord = ArrayCoordGuard::shared(&inner.coord_lock);
+        let storage = unsafe { Self::storage(inner) };
+        let len = inner.len.load(Ordering::Relaxed);
         if index >= len {
             return None;
         }
 
-        let target = inner.head.load(Ordering::Acquire) + index;
-        if target >= inner.capacity {
+        let target = inner.head.load(Ordering::Relaxed) + index;
+        if target >= storage.capacity {
             return None;
         }
 
         unsafe {
-            let slot = &*inner.slots.add(target);
+            let slot = &*storage.slots.add(target);
             slot.wait_write();
             slot.lock.lock_exclusive();
-            Some(WatchGuardMut::new(
-                (*slot.value.get()).assume_init_mut(),
-                slot.lock.clone(),
-            ))
+            let guard = WatchGuardMut::new((*slot.value.get()).assume_init_mut(), &slot.lock);
+            drop(coord);
+            Some(guard)
         }
+    }
+
+    /// Executes a closure while holding an exclusive guard on the element at `index`.
+    #[inline]
+    pub fn with_mut<R>(&self, index: usize, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.get_mut(index).map(|mut guard| f(&mut guard))
     }
 
     /// Reset array with new capacity and initializer
@@ -265,92 +341,57 @@ impl<T> AtomicArray<T> {
         assert!(new_cap > 0, "Capacity must be greater than 0");
 
         let inner_ptr = self.inner as *mut InnerArray<T>;
-        let inner = unsafe { &mut *inner_ptr };
-        let old_capacity = inner.capacity;
-        let old_len = inner.len.load(Ordering::Acquire);
-        let old_head = inner.head.load(Ordering::Acquire);
-        let old_slots = inner.slots;
+        let _coord = unsafe { ArrayCoordGuard::exclusive(&(*inner_ptr).coord_lock) };
+        let storage = unsafe { &mut *(*inner_ptr).storage.get() };
+        let old_capacity = storage.capacity;
+        let old_len = unsafe { (*inner_ptr).len.load(Ordering::Relaxed) };
+        let old_head = unsafe { (*inner_ptr).head.load(Ordering::Relaxed) };
+        let old_slots = storage.slots;
 
-        // Lock e drop dei vecchi valori
         unsafe {
-            if mem::needs_drop::<T>() {
-                for i in 0..old_len {
-                    let idx = old_head + i;
-                    if idx < old_capacity {
-                        let slot = &*old_slots.add(idx);
-                        if slot.is_written() {
-                            slot.lock.lock_exclusive();
-                            // FIX: drop il valore T, non MaybeUninit<T>
-                            ptr::drop_in_place((*slot.value.get()).as_mut_ptr());
-                            slot.lock.unlock_exclusive();
-                        }
-                    }
+            for i in 0..old_len {
+                let idx = old_head + i;
+                if idx >= old_capacity {
+                    continue;
                 }
-            } else {
-                // Anche senza drop, dobbiamo lockare per sicurezza
-                for i in 0..old_len {
-                    let idx = old_head + i;
-                    if idx < old_capacity {
-                        let slot = &*old_slots.add(idx);
-                        if slot.is_written() {
-                            slot.lock.lock_exclusive();
-                            slot.lock.unlock_exclusive();
-                        }
-                    }
+
+                let slot = &*old_slots.add(idx);
+                if !slot.is_written() {
+                    continue;
                 }
+
+                slot.lock.lock_exclusive();
+                if mem::needs_drop::<T>() {
+                    ptr::drop_in_place((*slot.value.get()).as_mut_ptr());
+                }
+                slot.reset();
+                slot.lock.unlock_exclusive();
             }
-        }
 
-        // Dealloca vecchi slot
-        unsafe {
             for i in 0..old_capacity {
                 ptr::drop_in_place(old_slots.add(i));
             }
-            let old_layout = std::alloc::Layout::from_size_align(
-                old_capacity * mem::size_of::<Slot<T>>(),
-                mem::align_of::<Slot<T>>(),
-            )
-                .expect("Failed to create layout");
-            std::alloc::dealloc(old_slots as *mut u8, old_layout);
         }
+        unsafe { Self::deallocate_slots(old_slots, old_capacity) };
 
-        // Alloca nuovi slot
-        let layout = std::alloc::Layout::from_size_align(
-            new_cap * mem::size_of::<Slot<T>>(),
-            mem::align_of::<Slot<T>>(),
-        )
-            .expect("Failed to create layout");
+        unsafe {
+            let slots = Self::allocate_slots(new_cap);
+            storage.slots = slots;
+            storage.capacity = new_cap;
+            (*inner_ptr).head.store(0, Ordering::Relaxed);
+            (*inner_ptr).tail.store(0, Ordering::Relaxed);
+            (*inner_ptr).len.store(0, Ordering::Relaxed);
 
-        let slots = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout) as *mut Slot<T>;
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
             for i in 0..new_cap {
-                ptr.add(i).write(Slot::new());
-            }
-            ptr
-        };
-
-        // Aggiorna inner
-        inner.slots = slots;
-        inner.capacity = new_cap;
-        inner.head.store(0, Ordering::Release);
-        inner.tail.store(0, Ordering::Release);
-        inner.len.store(0, Ordering::Release);
-
-        // Inizializza nuovi valori
-        for i in 0..new_cap {
-            let value = initializer();
-            unsafe {
-                let slot = &*inner.slots.add(i);
+                let value = initializer();
+                let slot = &*slots.add(i);
                 ptr::write(slot.value.get(), MaybeUninit::new(value));
                 slot.state.store(WRITE, Ordering::Release);
             }
-        }
 
-        inner.tail.store(new_cap, Ordering::Release);
-        inner.len.store(new_cap, Ordering::Release);
+            (*inner_ptr).tail.store(new_cap, Ordering::Relaxed);
+            (*inner_ptr).len.store(new_cap, Ordering::Relaxed);
+        }
 
         Ok(new_cap)
     }
@@ -360,22 +401,26 @@ impl<T> AtomicArray<T> {
     where
         T: Clone,
     {
-        let len = self.len();
+        let inner = self.inner();
+        let _coord = ArrayCoordGuard::shared(&inner.coord_lock);
+        let storage = unsafe { Self::storage(inner) };
+        let len = inner.len.load(Ordering::Relaxed);
         if len == 0 {
             return Vec::new();
         }
 
         let mut out = Vec::with_capacity(len);
-        let inner = self.inner();
-        let head = inner.head.load(Ordering::Acquire);
+        let head = inner.head.load(Ordering::Relaxed);
 
         unsafe {
             for i in 0..len {
                 let target = head + i;
-                if target < inner.capacity {
-                    let slot = &*inner.slots.add(target);
+                if target < storage.capacity {
+                    let slot = &*storage.slots.add(target);
                     slot.wait_write();
+                    slot.lock.lock_shared();
                     out.push((*slot.value.get()).assume_init_ref().clone());
+                    slot.lock.unlock_shared();
                 }
             }
         }
@@ -390,12 +435,14 @@ impl<T> AtomicArray<T> {
         F: FnMut(&T),
     {
         let inner = self.inner();
-        let len = inner.len.load(Ordering::Acquire);
-        let head = inner.head.load(Ordering::Acquire);
+        let _coord = ArrayCoordGuard::shared(&inner.coord_lock);
+        let storage = unsafe { Self::storage(inner) };
+        let len = inner.len.load(Ordering::Relaxed);
+        let head = inner.head.load(Ordering::Relaxed);
 
         unsafe {
             for i in 0..len {
-                let slot = &*inner.slots.add(head + i);
+                let slot = &*storage.slots.add(head + i);
                 slot.wait_write();
                 slot.lock.lock_shared();
                 f((*slot.value.get()).assume_init_ref());
@@ -411,12 +458,14 @@ impl<T> AtomicArray<T> {
         F: FnMut(&mut T),
     {
         let inner = self.inner();
-        let len = inner.len.load(Ordering::Acquire);
-        let head = inner.head.load(Ordering::Acquire);
+        let _coord = ArrayCoordGuard::shared(&inner.coord_lock);
+        let storage = unsafe { Self::storage(inner) };
+        let len = inner.len.load(Ordering::Relaxed);
+        let head = inner.head.load(Ordering::Relaxed);
 
         unsafe {
             for i in 0..len {
-                let slot = &*inner.slots.add(head + i);
+                let slot = &*storage.slots.add(head + i);
                 slot.wait_write();
                 slot.lock.lock_exclusive();
                 f((*slot.value.get()).assume_init_mut());
@@ -463,14 +512,15 @@ impl<T> Drop for AtomicArray<T> {
         fence(Ordering::Acquire);
 
         unsafe {
+            let storage = &*inner.storage.get();
             // Drop dei valori contenuti
             if mem::needs_drop::<T>() {
                 let len = inner.len.load(Ordering::Acquire);
                 let head = inner.head.load(Ordering::Acquire);
                 for i in 0..len {
                     let idx = head + i;
-                    if idx < inner.capacity {
-                        let slot = &*inner.slots.add(idx);
+                    if idx < storage.capacity {
+                        let slot = &*storage.slots.add(idx);
                         if slot.is_written() {
                             // FIX: drop il valore T, non MaybeUninit<T>
                             ptr::drop_in_place((*slot.value.get()).as_mut_ptr());
@@ -480,17 +530,17 @@ impl<T> Drop for AtomicArray<T> {
             }
 
             // Drop degli slot (RawMutex, AtomicUsize, etc.)
-            for i in 0..inner.capacity {
-                ptr::drop_in_place(inner.slots.add(i));
+            for i in 0..storage.capacity {
+                ptr::drop_in_place(storage.slots.add(i));
             }
 
             // Dealloca memoria slot
             let layout = std::alloc::Layout::from_size_align(
-                inner.capacity * mem::size_of::<Slot<T>>(),
+                storage.capacity * mem::size_of::<Slot<T>>(),
                 mem::align_of::<Slot<T>>(),
             )
-                .expect("Failed to create layout");
-            std::alloc::dealloc(inner.slots as *mut u8, layout);
+            .expect("Failed to create layout");
+            std::alloc::dealloc(storage.slots as *mut u8, layout);
 
             // Drop InnerArray
             drop(Box::from_raw(self.inner as *mut InnerArray<T>));

@@ -293,6 +293,68 @@ mod tests_smutex {
         assert!(exclusive_acquired.load(Ordering::Acquire));
     }
 
+    #[test]
+    fn test_first_group_unlock_does_not_release_waiting_writer() {
+        let mutex = Arc::new(SMutex::new());
+        let groups_ready = Arc::new(std::sync::Barrier::new(3));
+        let release_first = Arc::new(AtomicBool::new(false));
+        let release_second = Arc::new(AtomicBool::new(false));
+        let writer_acquired = Arc::new(AtomicBool::new(false));
+
+        let m = mutex.clone();
+        let ready = groups_ready.clone();
+        let release = release_first.clone();
+        let first_group = thread::spawn(move || {
+            let _guard = m.lock_group();
+            ready.wait();
+            while !release.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+        });
+
+        let m = mutex.clone();
+        let ready = groups_ready.clone();
+        let release = release_second.clone();
+        let second_group = thread::spawn(move || {
+            let _guard = m.lock_group();
+            ready.wait();
+            while !release.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+        });
+
+        groups_ready.wait();
+
+        let m = mutex.clone();
+        let acquired = writer_acquired.clone();
+        let writer = thread::spawn(move || {
+            let _guard = m.lock();
+            acquired.store(true, Ordering::Release);
+        });
+
+        for _ in 0..200 {
+            thread::yield_now();
+        }
+        assert!(!writer_acquired.load(Ordering::Acquire));
+
+        release_first.store(true, Ordering::Release);
+        first_group.join().unwrap();
+
+        for _ in 0..200 {
+            thread::yield_now();
+        }
+        assert!(
+            !writer_acquired.load(Ordering::Acquire),
+            "writer acquired after only one group guard was released"
+        );
+
+        release_second.store(true, Ordering::Release);
+        second_group.join().unwrap();
+        writer.join().unwrap();
+
+        assert!(writer_acquired.load(Ordering::Acquire));
+    }
+
     // ==================== Recursive Group Lock ====================
 
     #[test]

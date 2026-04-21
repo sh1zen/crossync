@@ -482,6 +482,74 @@ mod tests_mpmc {
         assert_eq!(chan.try_recv(), Some(2));
     }
 
+    #[test]
+    fn test_bounded_capacity_with_racing_senders() {
+        for _ in 0..64 {
+            let chan = Arc::new(Mpmc::bounded(1));
+            let barrier = Arc::new(Barrier::new(3));
+
+            let handles: Vec<_> = (0..2)
+                .map(|id| {
+                    let c = chan.clone();
+                    let b = barrier.clone();
+                    thread::spawn(move || {
+                        b.wait();
+                        c.send(id)
+                    })
+                })
+                .collect();
+
+            barrier.wait();
+
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let ok_count = results.iter().filter(|result| result.is_ok()).count();
+
+            assert_eq!(ok_count, 1, "bounded channel accepted more than one sender");
+            assert!(chan.try_recv().is_some());
+            assert!(chan.try_recv().is_none());
+        }
+    }
+
+    #[test]
+    fn test_send_and_close_race_keeps_consistent_state() {
+        for _ in 0..64 {
+            let chan = Arc::new(Mpmc::bounded(1));
+            let barrier = Arc::new(Barrier::new(3));
+
+            let sender_chan = chan.clone();
+            let sender_barrier = barrier.clone();
+            let sender = thread::spawn(move || {
+                sender_barrier.wait();
+                sender_chan.send(1)
+            });
+
+            let closer_chan = chan.clone();
+            let closer_barrier = barrier.clone();
+            let closer = thread::spawn(move || {
+                closer_barrier.wait();
+                closer_chan.close();
+            });
+
+            barrier.wait();
+
+            let send_result = sender.join().unwrap();
+            closer.join().unwrap();
+
+            assert!(chan.send(2).is_err(), "channel accepted sends after close");
+
+            let drained: Vec<_> = std::iter::from_fn(|| chan.try_recv()).collect();
+            assert!(drained.len() <= 1, "channel retained more than one value");
+
+            match send_result {
+                Ok(()) => assert_eq!(drained, vec![1]),
+                Err(value) => {
+                    assert_eq!(value, 1);
+                    assert!(drained.is_empty());
+                }
+            }
+        }
+    }
+
     // ==================== MEMORY SAFETY ====================
 
     #[derive(Clone)]

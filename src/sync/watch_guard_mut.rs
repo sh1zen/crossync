@@ -4,13 +4,12 @@ use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
-use std::ptr;
 
 /// used as wrapper for a pointer to a reference
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct WatchGuardMut<'a, T: ?Sized> {
     data: *mut T,
-    lock: RawMutex,
+    lock: *const RawMutex,
     marker: PhantomData<&'a mut T>,
 }
 
@@ -19,7 +18,7 @@ unsafe impl<T: ?Sized + Send> Send for WatchGuardMut<'_, T> {}
 
 impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
-    pub(crate) fn new(ptr: *mut T, lock: RawMutex) -> WatchGuardMut<'mutex, T> {
+    pub(crate) fn new(ptr: *mut T, lock: *const RawMutex) -> WatchGuardMut<'mutex, T> {
         Self {
             data: ptr,
             lock,
@@ -28,7 +27,7 @@ impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.lock.is_locked_exclusive()
+        unsafe { (*self.lock).is_locked_exclusive() }
     }
 }
 
@@ -74,15 +73,11 @@ impl<'mutex, T: Sized> WatchGuardMut<'mutex, T> {
         let dyn_any_ref: &mut dyn Any = unsafe { &mut **data };
 
         if TypeId::of::<U>() == (&*dyn_any_ref).type_id() {
-            // Move the lock out of the ManuallyDrop (so we don't leak/unlock twice).
-            // This performs a bitwise move of `this.lock`.
-            let lock = unsafe { ptr::read(&this.lock) };
-
             // SAFETY: We are casting from `dyn Any` to `U`.
             // Safe only because we just checked that the type IDs match.
             let u_ptr = unsafe { &mut *(dyn_any_ref as *mut dyn Any as *mut U) };
 
-            Ok(WatchGuardMut::new(u_ptr, lock))
+            Ok(WatchGuardMut::new(u_ptr, this.lock))
         } else {
             Err(ManuallyDrop::into_inner(this))
         }
@@ -93,14 +88,22 @@ impl<T: ?Sized> Deref for WatchGuardMut<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        debug_assert!(self.lock.is_locked_exclusive(), "{:?}", self.lock);
+        debug_assert!(
+            unsafe { (*self.lock).is_locked_exclusive() },
+            "{:?}",
+            unsafe { &*self.lock }
+        );
         unsafe { &*self.data }
     }
 }
 
 impl<T: ?Sized> DerefMut for WatchGuardMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        debug_assert!(self.lock.is_locked_exclusive(), "{:?}", self.lock);
+        debug_assert!(
+            unsafe { (*self.lock).is_locked_exclusive() },
+            "{:?}",
+            unsafe { &*self.lock }
+        );
         unsafe { &mut *self.data }
     }
 }
@@ -108,7 +111,7 @@ impl<T: ?Sized> DerefMut for WatchGuardMut<'_, T> {
 impl<T: ?Sized> Drop for WatchGuardMut<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.unlock_exclusive();
+        unsafe { (*self.lock).unlock_exclusive() };
     }
 }
 
@@ -125,7 +128,7 @@ impl<'a, T: Debug> Debug for WatchGuardMut<'a, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WatchGuardMut")
             .field("data", &self.data)
-            .field("lock", &self.lock)
+            .field("lock", &unsafe { &*self.lock })
             .finish()
     }
 }

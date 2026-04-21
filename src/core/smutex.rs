@@ -7,11 +7,11 @@ use std::thread;
 /// Internal bit flags
 const UNLOCKED: usize = 0;
 const LOCKED: usize = 1;
-const GROUP_FLAG: usize = 2;
+const ONE_GROUP: usize = 2;
 
 /// Recursive futex-based mutex supporting exclusive and group (shared) locks
 pub(crate) struct SMutex {
-    state: CachePadded<AtomicUsize>, // LOCKED/GROUP_FLAG
+    state: CachePadded<AtomicUsize>, // LOCKED or shared-holder count
     pub(crate) owner: CachePadded<AtomicUsize>, // thread ID for recursion
     pub(crate) recursion: CachePadded<AtomicUsize>, // recursion count
 }
@@ -35,13 +35,12 @@ impl SMutex {
     pub(crate) fn lock(&self) -> SGuard<'_> {
         let tid = Self::thread_id();
 
-        // Fast path: already owner → increment recursion
+        // Fast path: already owner -> increment recursion
         if self.owner.load(Ordering::Relaxed) == tid {
             self.recursion.fetch_add(1, Ordering::Relaxed);
             return SGuard::new(self);
         }
 
-        // Try acquire
         let spin = Backoff::new();
         loop {
             if self
@@ -59,8 +58,10 @@ impl SMutex {
                 continue;
             }
 
-            while self.state.load(Ordering::Relaxed) & LOCKED != 0 {
-                futex_wait(&self.state, LOCKED);
+            let mut state = self.state.load(Ordering::Relaxed);
+            while state != UNLOCKED {
+                futex_wait(&self.state, state);
+                state = self.state.load(Ordering::Relaxed);
             }
         }
     }
@@ -69,7 +70,7 @@ impl SMutex {
     pub(crate) fn lock_group(&self) -> SGuard<'_> {
         let tid = Self::thread_id();
 
-        // Already exclusive owner → can reenter
+        // Already exclusive owner -> can reenter
         if self.owner.load(Ordering::Relaxed) == tid {
             self.recursion.fetch_add(1, Ordering::Relaxed);
             return SGuard::new_group(self);
@@ -80,7 +81,10 @@ impl SMutex {
             let mut state = self.state.load(Ordering::Relaxed);
 
             while state & LOCKED == 0 {
-                let new_state = state | GROUP_FLAG;
+                let new_state = state
+                    .checked_add(ONE_GROUP)
+                    .expect("SMutex group count overflow");
+
                 match self.state.compare_exchange_weak(
                     state,
                     new_state,
@@ -92,11 +96,9 @@ impl SMutex {
                 }
             }
 
-            if state & LOCKED != 0 {
-                spin.snooze();
-                while self.state.load(Ordering::Relaxed) & LOCKED != 0 {
-                    futex_wait(&self.state, state);
-                }
+            spin.snooze();
+            while self.state.load(Ordering::Relaxed) & LOCKED != 0 {
+                futex_wait(&self.state, LOCKED);
             }
         }
     }
@@ -113,9 +115,8 @@ impl SMutex {
             return; // still holds recursion
         }
 
-        // fully release
         self.owner.store(0, Ordering::Relaxed);
-        self.state.fetch_and(!LOCKED, Ordering::Release);
+        self.state.store(UNLOCKED, Ordering::Release);
         futex_wake(&*self.state);
     }
 
@@ -123,16 +124,23 @@ impl SMutex {
     pub(crate) fn raw_unlock_group(&self) {
         let tid = Self::thread_id();
         if self.owner.load(Ordering::Relaxed) == tid {
-            // recursion path
             let rec = self.recursion.fetch_sub(1, Ordering::Relaxed);
             if rec > 1 {
                 return;
             }
+
             self.owner.store(0, Ordering::Relaxed);
+            self.state.store(UNLOCKED, Ordering::Release);
+            futex_wake(&*self.state);
+            return;
         }
 
-        self.state.fetch_and(!GROUP_FLAG, Ordering::Release);
-        futex_wake(&*self.state);
+        let prev = self.state.fetch_sub(ONE_GROUP, Ordering::Release);
+        debug_assert!(prev >= ONE_GROUP, "unlock_group without a matching lock_group");
+
+        if prev == ONE_GROUP {
+            futex_wake(&*self.state);
+        }
     }
 
     pub(crate) fn is_locked(&self) -> bool {

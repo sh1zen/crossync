@@ -61,7 +61,13 @@ impl<T> AtomicCell<T> {
         let lock = &self.inner().state;
         lock.lock_shared();
         let val = unsafe { (&*self.inner().val.get()).assume_init_ref() };
-        WatchGuardRef::new(val, lock.clone())
+        WatchGuardRef::new(val, lock)
+    }
+
+    /// Executes a closure while holding a shared guard.
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let guard = self.get();
+        f(&guard)
     }
 
     /// Exclusive mutable access via sync
@@ -69,7 +75,13 @@ impl<T> AtomicCell<T> {
         let lock = &self.inner().state;
         lock.lock_exclusive();
         let val = unsafe { (&mut *self.inner().val.get()).assume_init_mut() };
-        WatchGuardMut::new(val, lock.clone())
+        WatchGuardMut::new(val, lock)
+    }
+
+    /// Executes a closure while holding an exclusive guard.
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut guard = self.get_mut();
+        f(&mut guard)
     }
 
     /// Returns a raw pointer to the inner value
@@ -167,5 +179,3 @@ impl<T> Drop for AtomicCell<T> {
         }
     }
 }
-
-

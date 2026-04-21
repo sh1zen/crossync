@@ -1,4 +1,4 @@
-use crate::core::futex::{futex_wait, futex_wake, futex_wake_all};
+use crate::core::futex::{futex_wait, futex_wake_all};
 use crate::sync::Backoff;
 use crossbeam_utils::CachePadded;
 use std::fmt;
@@ -156,15 +156,15 @@ impl RawMutex {
     #[cold]
     fn lock_exclusive_slow(&self) {
         let inner = self.inner();
-        let mut acquire_with = UNLOCKED;
         let backoff = Backoff::new();
         let mut state = inner.state.load(Ordering::Relaxed);
 
         loop {
             while state & ONE_WRITER == 0 {
+                let new_state = (state & READERS_PARKED) | ONE_WRITER;
                 match inner.state.compare_exchange_weak(
                     state,
-                    state | ONE_WRITER | acquire_with,
+                    new_state,
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
@@ -204,7 +204,6 @@ impl RawMutex {
             }
 
             backoff.reset();
-            acquire_with = WRITERS_PARKED;
             state = inner.state.load(Ordering::Relaxed);
         }
     }
@@ -213,15 +212,23 @@ impl RawMutex {
     #[inline]
     fn unlock_exclusive_slow(&self) {
         let inner = self.inner();
-        let parked = inner.state.swap(UNLOCKED, Ordering::Release);
+        let state = inner.state.load(Ordering::Relaxed);
+        let parked = state & (READERS_PARKED | WRITERS_PARKED);
+        let next_state = if parked & WRITERS_PARKED != 0 {
+            parked
+        } else {
+            UNLOCKED
+        };
+        let parked = inner.state.swap(next_state, Ordering::Release);
 
         if parked & WRITERS_PARKED != 0 {
-            // Prioritize writers
+            // The parked-writer bit is boolean, not a waiter count.
+            // Wake every currently parked writer so none are stranded if the winner clears it.
             inner.writers_futex.fetch_add(1, Ordering::Release);
-            futex_wake(&*inner.writers_futex);
+            futex_wake_all(&*inner.writers_futex);
         }
 
-        if parked & READERS_PARKED != 0 {
+        if parked & READERS_PARKED != 0 && parked & WRITERS_PARKED == 0 {
             // Wake all waiting readers
             inner.readers_futex.fetch_add(1, Ordering::Release);
             futex_wake_all(&*inner.readers_futex);
@@ -242,6 +249,7 @@ impl RawMutex {
 
         if let Some(new_state) = state.checked_add(ONE_READER)
             && new_state & ONE_WRITER != ONE_WRITER
+            && state & WRITERS_PARKED == 0
         {
             return inner
                 .state
@@ -259,7 +267,7 @@ impl RawMutex {
         let mut state = inner.state.load(Ordering::Relaxed);
 
         while let Some(new_state) = state.checked_add(ONE_READER) {
-            if new_state & ONE_WRITER == ONE_WRITER {
+            if new_state & ONE_WRITER == ONE_WRITER || state & WRITERS_PARKED != 0 {
                 break;
             }
 
@@ -289,20 +297,11 @@ impl RawMutex {
         let inner = self.inner();
         let prev_state = inner.state.fetch_sub(ONE_READER, Ordering::Release);
 
-        // If this was the last reader and writers are waiting, wake one writer
-        if prev_state == (ONE_READER | WRITERS_PARKED)
-            && inner
-            .state
-            .compare_exchange(
-                WRITERS_PARKED,
-                UNLOCKED,
-                Ordering::Release,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-        {
+        // The parked-writer bit is boolean, not a waiter count.
+        // Wake every currently parked writer so none are stranded behind a stale bit.
+        if readers_count(prev_state) == 1 && (prev_state & WRITERS_PARKED != 0) {
             inner.writers_futex.fetch_add(1, Ordering::Release);
-            futex_wake(&*inner.writers_futex);
+            futex_wake_all(&*inner.writers_futex);
         }
     }
 
@@ -316,6 +315,10 @@ impl RawMutex {
             let mut state = inner.state.load(Ordering::Relaxed);
 
             while let Some(new_state) = state.checked_add(ONE_READER) {
+                if state & WRITERS_PARKED != 0 || new_state & ONE_WRITER == ONE_WRITER {
+                    break;
+                }
+
                 if inner
                     .state
                     .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
@@ -351,10 +354,10 @@ impl RawMutex {
             // Wait for a writer to release
             let w_key = inner.readers_futex.load(Ordering::Acquire);
 
-            // Check condition BEFORE waiting
+            // Retry immediately only once the lock is reader-visible again:
+            // no active writer and no queued writer to hand the lock to.
             let state = inner.state.load(Ordering::Acquire);
-            if state & ONE_WRITER != ONE_WRITER {
-                // Lock available, retry acquisition
+            if state & ONE_WRITER != ONE_WRITER && state & WRITERS_PARKED == 0 {
                 backoff.reset();
                 continue;
             }
@@ -396,7 +399,7 @@ impl RawMutex {
             {
                 if readers_count(new_state) == 0 && (state & WRITERS_PARKED != 0) {
                     inner.writers_futex.fetch_add(1, Ordering::Release);
-                    futex_wake(&*inner.writers_futex);
+                    futex_wake_all(&*inner.writers_futex);
                 }
                 break;
             }

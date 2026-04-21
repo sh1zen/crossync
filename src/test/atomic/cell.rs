@@ -38,6 +38,27 @@ mod tests_atomic_cell {
     }
 
     #[test]
+    fn test_with() {
+        let cell = AtomicCell::new(vec![1, 2, 3]);
+
+        assert_eq!(cell.with(|value| value.len()), 3);
+        assert_eq!(cell.with(|value| value[0]), 1);
+    }
+
+    #[test]
+    fn test_with_mut() {
+        let cell = AtomicCell::new(vec![1, 2, 3]);
+
+        let len = cell.with_mut(|value| {
+            value.push(4);
+            value.len()
+        });
+
+        assert_eq!(len, 4);
+        assert_eq!(cell.with(|value| value.clone()), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
     fn test_clone_and_drop_ref_count() {
         let cell = AtomicCell::new(42);
         let cloned = cell.clone();

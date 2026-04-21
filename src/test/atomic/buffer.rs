@@ -434,6 +434,9 @@ mod tests_atomic_buffer {
         let counter = Arc::new(AtomicUsize::new(0));
         let buffer = Arc::new(AtomicBuffer::with_capacity(32));
         let barrier = Arc::new(Barrier::new(6));
+        let items_per_producer = if cfg!(miri) { 8 } else { 20 };
+        let total_items = items_per_producer * 2;
+        let clone_iters = if cfg!(miri) { 2 } else { 5 };
 
         // 2 producers
         let producers: Vec<_> = (0..2)
@@ -443,8 +446,8 @@ mod tests_atomic_buffer {
                 let b = barrier.clone();
                 thread::spawn(move || {
                     b.wait();
-                    for i in 0..20 {
-                        let ptr = to_raw(Tracked::new(t * 20 + i, c.clone()));
+                    for i in 0..items_per_producer {
+                        let ptr = to_raw(Tracked::new(t * items_per_producer + i, c.clone()));
                         while buf.push(ptr).is_err() {
                             thread::yield_now();
                         }
@@ -463,7 +466,7 @@ mod tests_atomic_buffer {
                 thread::spawn(move || {
                     b.wait();
                     loop {
-                        if cons.load(Ordering::Relaxed) >= 40 {
+                        if cons.load(Ordering::Relaxed) >= total_items {
                             break;
                         }
                         if let Some(ptr) = buf.pop() {
@@ -484,7 +487,7 @@ mod tests_atomic_buffer {
                 let b = barrier.clone();
                 thread::spawn(move || {
                     b.wait();
-                    for _ in 0..5 {
+                    for _ in 0..clone_iters {
                         let c = (*buf).clone();
                         thread::yield_now();
                         drop(c);

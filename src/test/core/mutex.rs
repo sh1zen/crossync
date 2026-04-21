@@ -1,9 +1,18 @@
 mod tests_rawmutex {
-    use std::collections::HashSet;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Mutex as StdMutex;
-    use std::thread;
+    use crate::core::scondvar::SCondVar;
     use crate::sync::RawMutex;
+    use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn wait_until(timeout: Duration, condition: impl FnMut() -> bool) -> bool {
+        SCondVar::wait_until(timeout, condition)
+    }
+
     // ==================== Basic State ====================
 
     #[test]
@@ -64,9 +73,14 @@ mod tests_rawmutex {
         m.lock_exclusive();
 
         let m2 = m.clone();
-        let result = thread::spawn(move || m2.try_lock_exclusive()).join().unwrap();
+        let result = thread::spawn(move || m2.try_lock_exclusive())
+            .join()
+            .unwrap();
 
-        assert!(!result, "try_lock_exclusive should fail when already locked");
+        assert!(
+            !result,
+            "try_lock_exclusive should fail when already locked"
+        );
 
         m.unlock_exclusive();
     }
@@ -98,7 +112,10 @@ mod tests_rawmutex {
             }
         });
 
-        assert!(!violation.load(Ordering::Acquire), "Mutual exclusion violated");
+        assert!(
+            !violation.load(Ordering::Acquire),
+            "Mutual exclusion violated"
+        );
     }
 
     // ==================== Shared Lock ====================
@@ -283,6 +300,135 @@ mod tests_rawmutex {
         });
 
         assert!(exclusive_acquired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_parked_writer_blocks_late_readers() {
+        let m = RawMutex::new();
+        let writer_acquired = AtomicBool::new(false);
+        let release_writer = AtomicBool::new(false);
+        let writer_released = AtomicBool::new(false);
+        let late_reader_started = AtomicBool::new(false);
+        let late_reader_acquired = AtomicBool::new(false);
+
+        m.lock_shared();
+
+        thread::scope(|s| {
+            let writer_lock = m.clone();
+            let wa = &writer_acquired;
+            let rw = &release_writer;
+            let wr = &writer_released;
+            s.spawn(move || {
+                writer_lock.lock_exclusive();
+                wa.store(true, Ordering::Release);
+                while !rw.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                writer_lock.unlock_exclusive();
+                wr.store(true, Ordering::Release);
+            });
+
+            assert!(
+                wait_until(WAIT_TIMEOUT, || format!("{:?}", m)
+                    .contains("writers_parked: true")),
+                "writer never reached the parked state"
+            );
+
+            let reader_lock = m.clone();
+            let lrs = &late_reader_started;
+            let lra = &late_reader_acquired;
+            s.spawn(move || {
+                lrs.store(true, Ordering::Release);
+                reader_lock.lock_shared();
+                lra.store(true, Ordering::Release);
+                reader_lock.unlock_shared();
+            });
+
+            assert!(
+                wait_until(WAIT_TIMEOUT, || late_reader_started.load(Ordering::Acquire)),
+                "late reader never attempted to acquire the lock"
+            );
+            assert!(
+                !late_reader_acquired.load(Ordering::Acquire),
+                "late reader bypassed the parked writer"
+            );
+
+            m.unlock_shared();
+
+            let writer_won = wait_until(WAIT_TIMEOUT, || {
+                assert!(
+                    !late_reader_acquired.load(Ordering::Acquire),
+                    "late reader acquired before the parked writer"
+                );
+                writer_acquired.load(Ordering::Acquire)
+            });
+            assert!(
+                writer_won,
+                "writer did not acquire after the active reader left"
+            );
+            assert!(!late_reader_acquired.load(Ordering::Acquire));
+
+            release_writer.store(true, Ordering::Release);
+
+            assert!(
+                wait_until(WAIT_TIMEOUT, || writer_released.load(Ordering::Acquire)),
+                "writer did not release after being unblocked"
+            );
+
+            assert!(
+                wait_until(WAIT_TIMEOUT, || late_reader_acquired
+                    .load(Ordering::Acquire)),
+                "late reader never acquired after the writer"
+            );
+        });
+    }
+
+    #[test]
+    fn test_multiple_parked_writers_all_acquire() {
+        let m = RawMutex::new();
+        let started = AtomicUsize::new(0);
+        let acquired = AtomicUsize::new(0);
+
+        m.lock_exclusive();
+
+        thread::scope(|s| {
+            for _ in 0..3 {
+                let mm = m.clone();
+                let st = &started;
+                let acq = &acquired;
+                s.spawn(move || {
+                    st.fetch_add(1, Ordering::Release);
+                    mm.lock_exclusive();
+                    acq.fetch_add(1, Ordering::Release);
+                    thread::yield_now();
+                    mm.unlock_exclusive();
+                });
+            }
+
+            assert!(
+                wait_until(WAIT_TIMEOUT, || started.load(Ordering::Acquire) == 3),
+                "not all writers started parking"
+            );
+
+            assert!(
+                wait_until(WAIT_TIMEOUT, || format!("{:?}", m)
+                    .contains("writers_parked: true")),
+                "writers never reached the parked state"
+            );
+
+            m.unlock_exclusive();
+
+            assert_eq!(
+                {
+                    let all_acquired =
+                        wait_until(WAIT_TIMEOUT, || acquired.load(Ordering::Acquire) == 3);
+                    assert!(all_acquired, "some parked writers never acquired the lock");
+                    acquired.load(Ordering::Acquire)
+                },
+                3,
+                "some parked writers never acquired the lock"
+            );
+        });
     }
 
     // ==================== unlock_all_shared ====================
@@ -621,8 +767,8 @@ mod tests_rawmutex {
         thread::spawn(move || {
             m2.unlock_exclusive();
         })
-            .join()
-            .unwrap();
+        .join()
+        .unwrap();
 
         assert!(!m.is_locked());
     }
@@ -638,8 +784,8 @@ mod tests_rawmutex {
         thread::spawn(move || {
             m2.unlock_shared();
         })
-            .join()
-            .unwrap();
+        .join()
+        .unwrap();
 
         assert_eq!(m.get_shared_locked(), 1);
 
