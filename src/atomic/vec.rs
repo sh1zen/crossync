@@ -1,4 +1,5 @@
 use crate::atomic::AtomicBuffer;
+use crate::core::coord::{Coord, Exclusive};
 use crate::sync::Backoff;
 use crossbeam_utils::CachePadded;
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
@@ -19,25 +20,6 @@ const HAS_NEXT: usize = 1;
 const WRITE: usize = 1;
 const READ: usize = 2;
 
-const PENDING_SHIFT: u32 = 32;
-const READ_MASK: u64 = 0xFFFF_FFFF;
-const PENDING_ONE: u64 = 1 << PENDING_SHIFT;
-
-#[inline(always)]
-fn pack_counters(pending: u32, read: u32) -> u64 {
-    ((pending as u64) << PENDING_SHIFT) | (read as u64)
-}
-
-#[inline(always)]
-fn unpack_pending(val: u64) -> u32 {
-    (val >> PENDING_SHIFT) as u32
-}
-
-#[inline(always)]
-fn unpack_read(val: u64) -> u32 {
-    (val & READ_MASK) as u32
-}
-
 #[repr(C)]
 struct Slot<T> {
     state: AtomicUsize,
@@ -51,6 +33,18 @@ impl<T> Slot<T> {
         unsafe {
             while (*state).load(Ordering::Acquire) & WRITE == 0 {
                 backoff.snooze();
+            }
+        }
+    }
+}
+
+impl<T> Drop for Slot<T> {
+    fn drop(&mut self) {
+        let state = self.state.get_mut();
+        if *state & WRITE != 0 && *state & READ == 0 {
+            *state = READ;
+            unsafe {
+                self.value.get_mut().assume_init_drop();
             }
         }
     }
@@ -88,24 +82,6 @@ impl<T> Block<T> {
     }
 
     #[inline(always)]
-    fn inc_pending(&self) -> u64 {
-        self.counters.fetch_add(PENDING_ONE, Ordering::Acquire)
-    }
-
-    #[inline(always)]
-    fn dec_pending_inc_read(&self) -> (u32, u32) {
-        let delta = 1u64.wrapping_sub(PENDING_ONE);
-        let old = self.counters.fetch_add(delta, Ordering::AcqRel);
-        let new = old.wrapping_add(delta);
-        (unpack_pending(new), unpack_read(new))
-    }
-
-    #[inline(always)]
-    fn dec_pending(&self) {
-        self.counters.fetch_sub(PENDING_ONE, Ordering::Release);
-    }
-
-    #[inline(always)]
     fn wait_next(&self) -> *mut Self {
         let mut next = self.next.load(Ordering::Acquire);
         if !next.is_null() {
@@ -128,7 +104,17 @@ impl<T> Block<T> {
 
     #[inline]
     unsafe fn dealloc(ptr: *mut Self) {
-        unsafe { dealloc(ptr.cast(), Self::LAYOUT) };
+        unsafe {
+            drop(Box::from_raw(ptr));
+        };
+    }
+
+    /// No slot owns a value: only use for fresh, pooled or fully read blocks.
+    #[inline]
+    unsafe fn dealloc_empty(ptr: *mut Self) {
+        unsafe {
+            dealloc(ptr.cast(), Self::LAYOUT);
+        }
     }
 }
 
@@ -184,20 +170,15 @@ struct Position<T> {
     block: AtomicPtr<Block<T>>,
 }
 
-struct RecycleEntry<T> {
-    block: *mut Block<T>,
-    block_idx: usize,
-}
-
 struct InnerVec<T> {
     head: CachePadded<Position<T>>,
     tail: CachePadded<Position<T>>,
-    len: CachePadded<AtomicUsize>,
     block_array: BlockArray<T>,
     free_list: AtomicBuffer<Block<T>>,
-    recycle_queue: AtomicBuffer<RecycleEntry<T>>,
+    retired: AtomicPtr<Block<T>>,
+    retired_count: AtomicUsize,
     ref_count: AtomicUsize,
-    exclusive_lock: AtomicUsize,
+    coord_lock: Coord,
 }
 
 #[repr(transparent)]
@@ -220,12 +201,12 @@ impl<T> AtomicVec<T> {
                 block: AtomicPtr::new(ptr::null_mut()),
                 index: AtomicUsize::new(0),
             }),
-            len: CachePadded::new(AtomicUsize::new(0)),
             block_array: BlockArray::new(),
-            free_list: AtomicBuffer::with_capacity(64),
-            recycle_queue: AtomicBuffer::with_capacity(32),
+            free_list: AtomicBuffer::with_capacity(512),
+            retired: AtomicPtr::new(ptr::null_mut()),
+            retired_count: AtomicUsize::new(0),
             ref_count: AtomicUsize::new(1),
-            exclusive_lock: AtomicUsize::new(0),
+            coord_lock: Coord::new(),
         };
 
         let block = Block::<T>::new();
@@ -241,10 +222,10 @@ impl<T> AtomicVec<T> {
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
         let vec = Self::new();
-        let blocks_needed = (cap + BLOCK_CAP - 1) / BLOCK_CAP;
+        let blocks_needed = cap.div_ceil(BLOCK_CAP).min(65);
         for _ in 1..blocks_needed {
             let block = Block::<T>::new();
-            if vec.inner().free_list.push(block).is_err() {
+            if unsafe { vec.inner().free_list.push(block) }.is_err() {
                 unsafe { Block::dealloc(block) };
             }
         }
@@ -266,7 +247,10 @@ impl<T> AtomicVec<T> {
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.inner().len.load(Ordering::Relaxed)
+        let inner = self.inner();
+        let head = inner.head.index.load(Ordering::Acquire) >> INDEX_SHIFT;
+        let tail = inner.tail.index.load(Ordering::Acquire) >> INDEX_SHIFT;
+        self.calc_len(head, tail)
     }
 
     #[inline(always)]
@@ -282,68 +266,93 @@ impl<T> AtomicVec<T> {
         ((tail.wrapping_sub(head)) & !BLOCK_CAP_MASK) + BLOCK_CAP
     }
 
-    #[inline]
-    unsafe fn try_process_recycles(&self) {
+    /// Called only under exclusive coordination, after all pointer users leave.
+    unsafe fn reclaim_retired(&self) {
         let inner = self.inner();
-        for _ in 0..2 {
-            if let Some(entry_ptr) = inner.recycle_queue.pop() {
-                let entry = unsafe { Box::from_raw(entry_ptr) };
-                let counters = unsafe { (*entry.block).counters.load(Ordering::Acquire) };
-                if unpack_pending(counters) == 0 {
-                    inner.block_array.clear(entry.block_idx);
-                    unsafe {
-                        Block::reset(entry.block);
-                    }
-                    // FIX: Deallocate if free_list is full
-                    if inner.free_list.push(entry.block).is_err() {
-                        unsafe {
-                            Block::dealloc(entry.block);
-                        }
-                    }
+        let mut block = inner.retired.swap(ptr::null_mut(), Ordering::Relaxed);
+        inner.retired_count.store(0, Ordering::Relaxed);
+        unsafe {
+            while !block.is_null() {
+                let next = (*block).next.load(Ordering::Relaxed);
+                // No shared operations run during this grace period, so the
+                // pool length is exact. Fully read blocks need no slot reset
+                // or value drop when the bounded pool is already full.
+                if inner.free_list.len_approx() == inner.free_list.capacity() {
+                    Block::dealloc_empty(block);
                 } else {
-                    let _ = inner.recycle_queue.push(Box::into_raw(entry));
-                    break;
+                    Block::reset(block);
+                    if inner.free_list.push(block).is_err() {
+                        Block::dealloc_empty(block);
+                    }
                 }
-            } else {
-                break;
+                block = next;
+            }
+        }
+    }
+
+    /// Retirement cannot recycle memory while any shared operation is active.
+    unsafe fn retire(&self, block: *mut Block<T>) -> usize {
+        let inner = self.inner();
+        let mut next = inner.retired.load(Ordering::Relaxed);
+        loop {
+            unsafe {
+                (*block).next.store(next, Ordering::Relaxed);
+            }
+            match inner.retired.compare_exchange_weak(
+                next,
+                block,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => next = current,
+            }
+        }
+        inner.retired_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn try_reclaim(&self) {
+        let inner = self.inner();
+        let count = inner.retired_count.load(Ordering::Relaxed);
+        if count == 0 {
+            return;
+        }
+        // Force a grace period at a bounded backlog, even under continuous load.
+        let guard = if count >= 512 {
+            Some(inner.coord_lock.exclusive())
+        } else {
+            inner.coord_lock.try_exclusive()
+        };
+        if let Some(_guard) = guard {
+            unsafe {
+                self.reclaim_retired();
             }
         }
     }
 
     #[inline]
     unsafe fn acquire_block(&self) -> *mut Block<T> {
-        let inner = self.inner();
-        if let Some(block) = inner.free_list.pop() {
-            return block;
-        }
-
-        unsafe {
-            self.try_process_recycles();
-        }
-
-        inner.free_list.pop().unwrap_or_else(Block::<T>::new)
-    }
-
-    #[inline]
-    fn wait_exclusive(&self) {
-        let inner = self.inner();
-        let backoff = Backoff::new();
-        while inner
-            .exclusive_lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            backoff.snooze();
+        let pool = &self.inner().free_list;
+        if pool.is_empty_fast() {
+            Block::<T>::new()
+        } else {
+            pool.pop().unwrap_or_else(Block::<T>::new)
         }
     }
 
     #[inline]
-    fn release_exclusive(&self) {
-        self.inner().exclusive_lock.store(0, Ordering::Release);
+    fn wait_exclusive(&self) -> Exclusive<'_> {
+        self.inner().coord_lock.exclusive()
     }
 
     #[inline]
     pub fn push(&self, value: T) {
+        let _coord = self.inner().coord_lock.shared();
+        self.push_internal(value);
+    }
+
+    #[inline(always)]
+    fn push_internal(&self, value: T) {
         unsafe {
             let inner = self.inner();
 
@@ -384,8 +393,6 @@ impl<T> AtomicVec<T> {
                         let slot = (*block).slots.get_unchecked(offset);
                         slot.value.get().write(MaybeUninit::new(value));
                         slot.state.store(WRITE, Ordering::Release);
-
-                        inner.len.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                     Err(t) => {
@@ -407,106 +414,13 @@ impl<T> AtomicVec<T> {
 
     #[inline]
     pub fn pop(&self) -> Option<T> {
-        unsafe {
-            let inner = self.inner();
-
-            if inner.len.load(Ordering::Relaxed) == 0 {
-                return None;
-            }
-
-            let backoff = Backoff::new();
-            let mut head = inner.head.index.load(Ordering::Acquire);
-            let mut block = inner.head.block.load(Ordering::Acquire);
-
-            loop {
-                let offset = (head >> INDEX_SHIFT) & BLOCK_CAP_MASK;
-
-                if offset == BLOCK_CAP - 1 || block.is_null() {
-                    backoff.snooze();
-                    head = inner.head.index.load(Ordering::Acquire);
-                    block = inner.head.block.load(Ordering::Acquire);
-                    continue;
-                }
-
-                let mut new_head = head + (1 << INDEX_SHIFT);
-
-                if new_head & HAS_NEXT == 0 {
-                    fence(Ordering::SeqCst);
-                    let tail = inner.tail.index.load(Ordering::Relaxed);
-                    let head_idx = head >> INDEX_SHIFT;
-                    let tail_idx = tail >> INDEX_SHIFT;
-
-                    if head_idx == tail_idx {
-                        return None;
-                    }
-
-                    if (head_idx >> BLOCK_SHIFT) != (tail_idx >> BLOCK_SHIFT) {
-                        new_head |= HAS_NEXT;
-                    }
-                }
-
-                (*block).inc_pending();
-
-                match inner.head.index.compare_exchange_weak(
-                    head,
-                    new_head,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        if offset + 1 == BLOCK_CAP - 1 {
-                            let next = (*block).wait_next();
-                            let mut next_index =
-                                (new_head & !HAS_NEXT).wrapping_add(1 << INDEX_SHIFT);
-
-                            if !(*next).get_next().is_null() {
-                                next_index |= HAS_NEXT;
-                            }
-
-                            inner.head.block.store(next, Ordering::Release);
-                            inner.head.index.store(next_index, Ordering::Release);
-                        }
-
-                        let slot = (*block).slots.get_unchecked(offset);
-                        Slot::<T>::wait_write_raw(&slot.state as *const _);
-                        let value = slot.value.get().read().assume_init();
-                        slot.state.store(READ, Ordering::Relaxed);
-
-                        inner.len.fetch_sub(1, Ordering::Relaxed);
-
-                        let (pending, read_count) = (*block).dec_pending_inc_read();
-
-                        if read_count == (BLOCK_CAP - 1) as u32 {
-                            let block_idx = (head >> INDEX_SHIFT) >> BLOCK_SHIFT;
-                            if pending == 0 {
-                                inner.block_array.clear(block_idx);
-                                Block::reset(block);
-                                // FIX: Deallocate if free_list is full
-                                if inner.free_list.push(block).is_err() {
-                                    Block::dealloc(block);
-                                }
-                            } else {
-                                let entry =
-                                    Box::into_raw(Box::new(RecycleEntry { block, block_idx }));
-                                if inner.recycle_queue.push(entry).is_err() {
-                                    // FIX: Deallocate both entry and block
-                                    drop(Box::from_raw(entry));
-                                    Block::dealloc(block);
-                                }
-                            }
-                        }
-
-                        return Some(value);
-                    }
-                    Err(h) => {
-                        (*block).dec_pending();
-                        head = h;
-                        block = inner.head.block.load(Ordering::Acquire);
-                        backoff.spin();
-                    }
-                }
-            }
+        let coord = self.inner().coord_lock.shared();
+        let (result, reclaim) = self.pop_raw();
+        drop(coord);
+        if reclaim {
+            self.try_reclaim();
         }
+        result
     }
 
     #[inline]
@@ -527,28 +441,20 @@ impl<T> AtomicVec<T> {
     }
 
     pub fn reset_with(&self, cap: usize, mut init: impl FnMut() -> T) -> usize {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
 
         let inner = self.inner();
 
-        while self.pop().is_some() {}
+        while self.pop_internal().is_some() {}
 
         unsafe {
-            while let Some(entry_ptr) = inner.recycle_queue.pop() {
-                let entry = Box::from_raw(entry_ptr);
-                inner.block_array.clear(entry.block_idx);
-                Block::reset(entry.block);
-                if inner.free_list.push(entry.block).is_err() {
-                    Block::dealloc(entry.block);
-                }
-            }
+            self.reclaim_retired();
         }
 
         let old_block = inner.head.block.load(Ordering::Relaxed);
 
         inner.head.index.store(0, Ordering::Relaxed);
         inner.tail.index.store(0, Ordering::Relaxed);
-        inner.len.store(0, Ordering::Relaxed);
 
         for i in 0..BLOCK_CAP {
             inner.block_array.set(i, ptr::null_mut());
@@ -569,26 +475,29 @@ impl<T> AtomicVec<T> {
         }
 
         for _ in 0..cap {
-            self.push(init());
+            self.push_internal(init());
         }
 
-        self.release_exclusive();
         cap
     }
 
     pub fn as_vec(&self) -> Vec<T> {
-        self.wait_exclusive();
-        let out = self.drain();
-        self.release_exclusive();
+        let _coord = self.wait_exclusive();
+        let mut out = Vec::with_capacity(self.len());
+        while let Some(value) = self.pop_internal() {
+            out.push(value);
+        }
+        unsafe {
+            self.reclaim_retired();
+        }
         out
     }
 }
 
 impl<T: PartialEq> AtomicVec<T> {
     pub fn index_of(&self, value: &T) -> Option<usize> {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         let result = self.index_of_inner(value);
-        self.release_exclusive();
         result
     }
 
@@ -641,9 +550,8 @@ impl<T> AtomicVec<T> {
         F: Fn(&T) -> bool,
         T: Clone,
     {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         let result = self.find_inner(predicate);
-        self.release_exclusive();
         result
     }
 
@@ -690,9 +598,8 @@ impl<T> AtomicVec<T> {
     where
         F: Fn(&T),
     {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         self.for_each_inner(f);
-        self.release_exclusive();
     }
 
     fn for_each_inner<F>(&self, f: F)
@@ -734,9 +641,8 @@ impl<T> AtomicVec<T> {
     where
         F: Fn(B, &T) -> B,
     {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         let result = self.fold_inner(init, f);
-        self.release_exclusive();
         result
     }
 
@@ -782,9 +688,8 @@ impl<T> AtomicVec<T> {
         F: Fn(T, &T) -> T,
         T: Clone,
     {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         let result = self.reduce_inner(f);
-        self.release_exclusive();
         result
     }
 
@@ -837,9 +742,8 @@ impl<T> AtomicVec<T> {
     where
         T: Clone,
     {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         let result = self.get_inner(index);
-        self.release_exclusive();
         result
     }
 
@@ -860,15 +764,11 @@ impl<T> AtomicVec<T> {
                 return None;
             }
 
-            let target_abs = start_idx + index;
-            let offset = target_abs & BLOCK_CAP_MASK;
-
-            let adjusted_offset = offset + (target_abs / (BLOCK_CAP - 1));
-            let adjusted_block_idx = (start_idx + adjusted_offset) >> BLOCK_SHIFT;
-            let final_offset = (start_idx + adjusted_offset) & BLOCK_CAP_MASK;
-
+            let logical = (start_idx & BLOCK_CAP_MASK) + index;
+            let adjusted_block_idx = (start_idx >> BLOCK_SHIFT) + logical / (BLOCK_CAP - 1);
+            let final_offset = logical % (BLOCK_CAP - 1);
             let block = self.get_block_at(adjusted_block_idx, start_idx >> BLOCK_SHIFT);
-            if block.is_null() || final_offset >= BLOCK_CAP - 1 {
+            if block.is_null() {
                 return None;
             }
 
@@ -885,10 +785,11 @@ impl<T> AtomicVec<T> {
         if end <= start {
             return 0;
         }
-        let total_slots = end - start;
-        let full_blocks = total_slots / BLOCK_CAP;
-        let remainder = total_slots % BLOCK_CAP;
-        full_blocks * (BLOCK_CAP - 1) + remainder.min(BLOCK_CAP - 1)
+        let logical = |physical: usize| {
+            (physical >> BLOCK_SHIFT) * (BLOCK_CAP - 1)
+                + (physical & BLOCK_CAP_MASK).min(BLOCK_CAP - 1)
+        };
+        logical(end) - logical(start)
     }
 
     unsafe fn get_block_at(&self, target_block: usize, start_block: usize) -> *mut Block<T> {
@@ -913,9 +814,8 @@ impl<T> AtomicVec<T> {
         if i == j {
             return true;
         }
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         let result = self.swap_inner(i, j);
-        self.release_exclusive();
         result
     }
 
@@ -947,25 +847,11 @@ impl<T> AtomicVec<T> {
     }
 
     unsafe fn get_slot_ptr(&self, index: usize, start_idx: usize) -> *mut Slot<T> {
-        let slots_per_block = BLOCK_CAP - 1;
-        let block_num = index / slots_per_block;
-        let slot_in_block = index % slots_per_block;
-
-        let target_block = (start_idx >> BLOCK_SHIFT) + block_num;
+        let logical = (start_idx & BLOCK_CAP_MASK) + index;
+        let target_block = (start_idx >> BLOCK_SHIFT) + logical / (BLOCK_CAP - 1);
+        let offset = logical % (BLOCK_CAP - 1);
         let block = unsafe { self.get_block_at(target_block, start_idx >> BLOCK_SHIFT) };
-
         if block.is_null() {
-            return ptr::null_mut();
-        }
-
-        let base_offset = if block_num == 0 {
-            start_idx & BLOCK_CAP_MASK
-        } else {
-            0
-        };
-
-        let offset = base_offset + slot_in_block;
-        if offset >= BLOCK_CAP - 1 {
             return ptr::null_mut();
         }
 
@@ -973,9 +859,8 @@ impl<T> AtomicVec<T> {
     }
 
     pub fn remove(&self, index: usize) -> Option<T> {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         let result = self.remove_inner(index);
-        self.release_exclusive();
         result
     }
 
@@ -992,7 +877,7 @@ impl<T> AtomicVec<T> {
 
         if index >= elements.len() {
             for v in elements {
-                self.push(v);
+                self.push_internal(v);
             }
             return None;
         }
@@ -1000,16 +885,15 @@ impl<T> AtomicVec<T> {
         let removed = elements.remove(index);
 
         for v in elements {
-            self.push(v);
+            self.push_internal(v);
         }
 
         Some(removed)
     }
 
     pub fn reverse(&self) {
-        self.wait_exclusive();
+        let _coord = self.wait_exclusive();
         self.reverse_inner();
-        self.release_exclusive();
     }
 
     fn reverse_inner(&self) {
@@ -1019,17 +903,19 @@ impl<T> AtomicVec<T> {
         }
 
         for v in elements.into_iter().rev() {
-            self.push(v);
+            self.push_internal(v);
         }
     }
 
+    #[inline]
     fn pop_internal(&self) -> Option<T> {
+        self.pop_raw().0
+    }
+
+    #[inline(always)]
+    fn pop_raw(&self) -> (Option<T>, bool) {
         unsafe {
             let inner = self.inner();
-
-            if inner.len.load(Ordering::Relaxed) == 0 {
-                return None;
-            }
 
             let backoff = Backoff::new();
             let mut head = inner.head.index.load(Ordering::Acquire);
@@ -1054,15 +940,13 @@ impl<T> AtomicVec<T> {
                     let tail_idx = tail >> INDEX_SHIFT;
 
                     if head_idx == tail_idx {
-                        return None;
+                        return (None, false);
                     }
 
                     if (head_idx >> BLOCK_SHIFT) != (tail_idx >> BLOCK_SHIFT) {
                         new_head |= HAS_NEXT;
                     }
                 }
-
-                (*block).inc_pending();
 
                 match inner.head.index.compare_exchange_weak(
                     head,
@@ -1089,34 +973,16 @@ impl<T> AtomicVec<T> {
                         let value = slot.value.get().read().assume_init();
                         slot.state.store(READ, Ordering::Relaxed);
 
-                        inner.len.fetch_sub(1, Ordering::Relaxed);
-
-                        let (pending, read_count) = (*block).dec_pending_inc_read();
-
-                        if read_count == (BLOCK_CAP - 1) as u32 {
-                            let block_idx = (head >> INDEX_SHIFT) >> BLOCK_SHIFT;
-                            if pending == 0 {
-                                inner.block_array.clear(block_idx);
-                                Block::reset(block);
-                                // FIX: Deallocate if free_list is full
-                                if inner.free_list.push(block).is_err() {
-                                    Block::dealloc(block);
-                                }
-                            } else {
-                                let entry =
-                                    Box::into_raw(Box::new(RecycleEntry { block, block_idx }));
-                                if inner.recycle_queue.push(entry).is_err() {
-                                    // FIX: Deallocate both entry and block
-                                    drop(Box::from_raw(entry));
-                                    Block::dealloc(block);
-                                }
-                            }
-                        }
-
-                        return Some(value);
+                        let read_count = (*block).counters.fetch_add(1, Ordering::AcqRel) + 1;
+                        let reclaim = if read_count == (BLOCK_CAP - 1) as u64 {
+                            let retired = self.retire(block);
+                            retired >= 64 && retired % 64 == 0
+                        } else {
+                            false
+                        };
+                        return (Some(value), reclaim);
                     }
                     Err(h) => {
-                        (*block).dec_pending();
                         head = h;
                         block = inner.head.block.load(Ordering::Acquire);
                         backoff.spin();
@@ -1129,7 +995,7 @@ impl<T> AtomicVec<T> {
 
 impl<T> Clone for AtomicVec<T> {
     fn clone(&self) -> Self {
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::increment_ref_count(&self.inner().ref_count);
         Self { inner: self.inner }
     }
 }
@@ -1144,33 +1010,24 @@ impl<T> Drop for AtomicVec<T> {
         fence(Ordering::Acquire);
 
         unsafe {
+            let mut owned = Vec::new();
             let mut block = inner.head.block.load(Ordering::Relaxed);
             while !block.is_null() {
                 let next = (*block).next.load(Ordering::Relaxed);
-
-                if mem::needs_drop::<T>() {
-                    for slot in &(*block).slots {
-                        let state = slot.state.load(Ordering::Relaxed);
-                        if state & WRITE != 0 && state & READ == 0 {
-                            ptr::drop_in_place((*slot.value.get()).as_mut_ptr());
-                        }
-                    }
-                }
-
-                Block::dealloc(block);
+                owned.push(Box::from_raw(block));
                 block = next;
             }
-
-            for b in inner.free_list.drain_all() {
-                Block::dealloc(b);
+            for block in inner.free_list.drain_all() {
+                owned.push(Box::from_raw(block));
             }
-
-            for entry_ptr in inner.recycle_queue.drain_all() {
-                let entry = Box::from_raw(entry_ptr);
-                Block::dealloc(entry.block);
+            let mut block = inner.retired.load(Ordering::Relaxed);
+            while !block.is_null() {
+                let next = (*block).next.load(Ordering::Relaxed);
+                owned.push(Box::from_raw(block));
+                block = next;
             }
-
-            drop(Box::from_raw(self.inner as *mut InnerVec<T>));
+            drop(Box::from_raw(self.inner.cast_mut()));
+            drop(owned);
         }
     }
 }
@@ -1197,6 +1054,3 @@ impl<T: fmt::Debug> fmt::Debug for AtomicVec<T> {
             .finish()
     }
 }
-
-unsafe impl<T: Send> Send for RecycleEntry<T> {}
-unsafe impl<T: Send> Sync for RecycleEntry<T> {}

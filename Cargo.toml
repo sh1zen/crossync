@@ -1,6 +1,6 @@
 [package]
 name = "crossync"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["Andrea Frolli dev.sh1zen@outlook.it"]
 edition = "2024"
 description = "A fast concurrent programming suite for Rust."
@@ -19,7 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 
-crossbeam-utils = "0.8.21"
+crossbeam-utils = "0.8.23"
 
 [dev-dependencies]
 criterion = "0.8.2"
@@ -30,7 +30,7 @@ path = "benches/bench.rs"
 harness = false
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
-libc = "0.2.185"
+libc = "0.2.190"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_System_WindowsProgramming"] }

@@ -1,17 +1,18 @@
-use crate::core::futex::{futex_wait, futex_wake};
+use crate::core::futex::{Futex, futex_wait, futex_wake};
 use crate::sync::Backoff;
 use crossbeam_utils::CachePadded;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
 
 /// Internal bit flags
-const UNLOCKED: usize = 0;
-const LOCKED: usize = 1;
-const ONE_GROUP: usize = 2;
+const UNLOCKED: u32 = 0;
+const LOCKED: u32 = 1;
+const ONE_GROUP: u32 = 2;
 
 /// Recursive futex-based mutex supporting exclusive and group (shared) locks
 pub(crate) struct SMutex {
-    state: CachePadded<AtomicUsize>, // LOCKED or shared-holder count
+    state: CachePadded<Futex>,                  // LOCKED or shared-holder count
     pub(crate) owner: CachePadded<AtomicUsize>, // thread ID for recursion
     pub(crate) recursion: CachePadded<AtomicUsize>, // recursion count
 }
@@ -19,16 +20,21 @@ pub(crate) struct SMutex {
 impl SMutex {
     pub(crate) fn new() -> Self {
         Self {
-            state: CachePadded::new(AtomicUsize::new(UNLOCKED)),
+            state: CachePadded::new(Futex::new(UNLOCKED)),
             owner: CachePadded::new(AtomicUsize::new(0)),
             recursion: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
     fn thread_id() -> usize {
-        // Convert ThreadId to usize
-        let tid: thread::ThreadId = thread::current().id();
-        unsafe { std::mem::transmute::<thread::ThreadId, usize>(tid) }
+        thread_local! {
+            static ID: usize = {
+                static NEXT: AtomicUsize = AtomicUsize::new(1);
+                NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                    .expect("thread identifier overflow")
+            };
+        }
+        ID.with(|id| *id)
     }
 
     /// Exclusive lock
@@ -136,7 +142,10 @@ impl SMutex {
         }
 
         let prev = self.state.fetch_sub(ONE_GROUP, Ordering::Release);
-        debug_assert!(prev >= ONE_GROUP, "unlock_group without a matching lock_group");
+        debug_assert!(
+            prev >= ONE_GROUP,
+            "unlock_group without a matching lock_group"
+        );
 
         if prev == ONE_GROUP {
             futex_wake(&*self.state);
@@ -152,32 +161,23 @@ impl SMutex {
 pub(crate) struct SGuard<'a> {
     pub(crate) m: &'a SMutex,
     pub(crate) is_group: bool,
+    not_send: PhantomData<Rc<()>>,
 }
 
 impl<'a> SGuard<'a> {
     fn new(m: &'a SMutex) -> Self {
-        Self { m, is_group: false }
-    }
-
-    pub(crate) fn new_group(m: &'a SMutex) -> Self {
-        Self { m, is_group: true }
-    }
-
-    /// Explicit unlock
-    pub(crate) fn unlock(this: &SGuard<'_>) {
-        if this.is_group {
-            this.m.raw_unlock_group();
-        } else {
-            this.m.raw_unlock();
+        Self {
+            m,
+            is_group: false,
+            not_send: PhantomData,
         }
     }
 
-    /// Explicit lock (reacquire)
-    pub(crate) fn lock(this: &SGuard<'_>) {
-        if this.is_group {
-            this.m.lock_group();
-        } else {
-            this.m.lock();
+    pub(crate) fn new_group(m: &'a SMutex) -> Self {
+        Self {
+            m,
+            is_group: true,
+            not_send: PhantomData,
         }
     }
 }

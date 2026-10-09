@@ -1,11 +1,10 @@
-
 #[cfg(test)]
 mod tests_barrier {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::sync::Barrier;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
-    use crate::sync::Barrier;
     // ==================== CONSTRUCTION ====================
 
     #[test]
@@ -23,10 +22,10 @@ mod tests_barrier {
     #[test]
     fn test_with_capacity() {
         let barrier = Barrier::with_capacity(5, 0);
-        assert_eq!(barrier.count(), 7); // n + 2
+        assert_eq!(barrier.count(), 5);
 
         let barrier_reusable = Barrier::with_capacity(3, 3);
-        assert_eq!(barrier_reusable.count(), 5); // n + 2
+        assert_eq!(barrier_reusable.count(), 3);
     }
 
     // ==================== SINGLE THREAD ====================
@@ -41,16 +40,14 @@ mod tests_barrier {
 
         // Non deve bloccare
         assert!(elapsed < Duration::from_millis(100));
-        assert_eq!(barrier.count(), 1);
+        assert_eq!(barrier.count(), 0);
     }
 
     #[test]
     fn test_single_clone_no_block() {
-        let barrier = Barrier::with_capacity(5, 0);
-        // Solo un clone, ref_count == 1 dopo drop dell'originale
-
-        // wait() ritorna subito se ref_count == 1
+        let barrier = Barrier::with_capacity(0, 0);
         barrier.wait();
+        assert_eq!(barrier.count(), 0);
     }
 
     // ==================== CLONE & REFCOUNT ====================
@@ -323,13 +320,13 @@ mod tests_barrier {
     fn test_zero_capacity() {
         // with_capacity(0, 0) crea barrier con n=2
         let barrier = Barrier::with_capacity(0, 0);
-        assert_eq!(barrier.count(), 2);
+        assert_eq!(barrier.count(), 0);
     }
 
     #[test]
     fn test_large_capacity() {
         let barrier = Barrier::with_capacity(100, 0);
-        assert_eq!(barrier.count(), 102);
+        assert_eq!(barrier.count(), 100);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-use crate::sync::{RawMutex, WatchGuardMut, WatchGuardRef};
+use crate::core::serial::SerialMutex;
+use crate::sync::{WatchGuardMut, WatchGuardRef};
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
@@ -12,7 +13,7 @@ struct Inner<T> {
     /// Value stored in the cell, possibly uninitialized
     val: UnsafeCell<MaybeUninit<T>>,
     /// Mutex protecting concurrent access
-    state: RawMutex,
+    state: SerialMutex,
     /// Reference count for clone/drop semantics
     ref_count: CachePadded<AtomicUsize>,
 }
@@ -22,15 +23,16 @@ impl<T> Inner<T> {
     fn new(val: T) -> Self {
         Self {
             val: UnsafeCell::new(MaybeUninit::new(val)),
-            state: RawMutex::new(),
+            state: SerialMutex::new(),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
         }
     }
 }
 
-// Interior mutability: safe only because access is protected by the lock
+// Read groups are confined to one acquiring thread; writes exclude all guards.
+// Read guards themselves remain Send/Sync only for T: Sync.
 unsafe impl<T: Send> Send for AtomicCell<T> {}
-unsafe impl<T: Sync> Sync for AtomicCell<T> {}
+unsafe impl<T: Send> Sync for AtomicCell<T> {}
 
 // Safe for unwind scenarios
 impl<T> UnwindSafe for AtomicCell<T> {}
@@ -57,11 +59,12 @@ impl<T> AtomicCell<T> {
     }
 
     /// Shared (read-only) access via sync
+    #[inline]
     pub fn get(&self) -> WatchGuardRef<'_, T> {
-        let lock = &self.inner().state;
-        lock.lock_shared();
+        let lock: &SerialMutex = &self.inner().state;
+        let owner = lock.lock_read();
         let val = unsafe { (&*self.inner().val.get()).assume_init_ref() };
-        WatchGuardRef::new(val, lock)
+        WatchGuardRef::serial(val, lock, owner)
     }
 
     /// Executes a closure while holding a shared guard.
@@ -71,11 +74,12 @@ impl<T> AtomicCell<T> {
     }
 
     /// Exclusive mutable access via sync
+    #[inline]
     pub fn get_mut(&self) -> WatchGuardMut<'_, T> {
-        let lock = &self.inner().state;
-        lock.lock_exclusive();
+        let lock: &SerialMutex = &self.inner().state;
+        lock.lock_write();
         let val = unsafe { (&mut *self.inner().val.get()).assume_init_mut() };
-        WatchGuardMut::new(val, lock)
+        WatchGuardMut::serial(val, lock)
     }
 
     /// Executes a closure while holding an exclusive guard.
@@ -134,8 +138,7 @@ impl<T> AtomicCell<T> {
 
     /// Store a new value, dropping the old one
     pub fn store(&self, val: T) {
-        let mut guard = self.get_mut();
-        *guard = val;
+        drop(self.swap(val));
     }
 }
 
@@ -155,7 +158,7 @@ impl<T: Copy + Eq> AtomicCell<T> {
 
 impl<T> Clone for AtomicCell<T> {
     fn clone(&self) -> Self {
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::increment_ref_count(&self.inner().ref_count);
         Self { ptr: self.ptr }
     }
 }
@@ -169,12 +172,10 @@ impl<T> Drop for AtomicCell<T> {
 
             // SAFETY: We're the last reference, so we can safely drop the inner value
             unsafe {
-                // First, drop the contained value
-                let val_ptr = (*self.ptr).val.get();
-                std::ptr::drop_in_place((*val_ptr).assume_init_mut());
-
-                // Then deallocate the Inner struct
-                drop(Box::from_raw(self.ptr as *mut Inner<T>));
+                // Own the allocation first, so unwinding a T destructor
+                // still deallocates Inner and its SerialMutex.
+                let boxed = Box::from_raw(self.ptr.cast_mut());
+                (*boxed.val.get()).assume_init_drop();
             }
         }
     }

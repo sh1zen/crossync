@@ -63,7 +63,7 @@ mod tests_atomic_buffer {
         let buffer = AtomicBuffer::<i32>::new();
         let val = Box::into_raw(Box::new(42));
 
-        assert!(buffer.push(val).is_ok());
+        assert!(unsafe { buffer.push(val) }.is_ok());
 
         let popped = buffer.pop().unwrap();
         unsafe {
@@ -79,7 +79,7 @@ mod tests_atomic_buffer {
         let buffer = AtomicBuffer::<i32>::new();
 
         for i in 0..10 {
-            buffer.push(Box::into_raw(Box::new(i))).unwrap();
+            unsafe { buffer.push(Box::into_raw(Box::new(i))) }.unwrap();
         }
 
         for i in 0..10 {
@@ -98,11 +98,11 @@ mod tests_atomic_buffer {
         let buffer = AtomicBuffer::<i32>::with_capacity(4);
 
         for i in 0..4 {
-            buffer.push(Box::into_raw(Box::new(i))).unwrap();
+            unsafe { buffer.push(Box::into_raw(Box::new(i))) }.unwrap();
         }
 
         let overflow = Box::into_raw(Box::new(999));
-        let result = buffer.push(overflow);
+        let result = unsafe { buffer.push(overflow) };
         assert!(result.is_err());
         unsafe { drop_raw(result.unwrap_err()) };
 
@@ -122,7 +122,7 @@ mod tests_atomic_buffer {
 
         // With elements
         for i in 0..10 {
-            buffer.push(Box::into_raw(Box::new(i))).unwrap();
+            unsafe { buffer.push(Box::into_raw(Box::new(i))) }.unwrap();
         }
 
         let drained: Vec<_> = buffer.drain_all().collect();
@@ -140,7 +140,7 @@ mod tests_atomic_buffer {
     #[test]
     fn test_clone_shares_data() {
         let buffer = AtomicBuffer::<i32>::new();
-        buffer.push(Box::into_raw(Box::new(42))).unwrap();
+        unsafe { buffer.push(Box::into_raw(Box::new(42))) }.unwrap();
 
         let c1 = buffer.clone();
         let c2 = buffer.clone();
@@ -161,7 +161,7 @@ mod tests_atomic_buffer {
         drop(c1);
         drop(c2);
 
-        buffer.push(Box::into_raw(Box::new(100))).unwrap();
+        unsafe { buffer.push(Box::into_raw(Box::new(100))) }.unwrap();
         let ptr = c3.pop().unwrap();
         unsafe {
             assert_eq!(*ptr, 100);
@@ -177,9 +177,7 @@ mod tests_atomic_buffer {
 
         let buffer = AtomicBuffer::new();
         for i in 0..16 {
-            buffer
-                .push(to_raw(Tracked::new(i, counter.clone())))
-                .unwrap();
+            unsafe { buffer.push(to_raw(Tracked::new(i, counter.clone()))) }.unwrap();
         }
         assert_eq!(counter.load(Ordering::SeqCst), 16);
 
@@ -197,9 +195,7 @@ mod tests_atomic_buffer {
 
         // Con cloni
         for i in 0..5 {
-            buffer
-                .push(to_raw(Tracked::new(i, counter.clone())))
-                .unwrap();
+            unsafe { buffer.push(to_raw(Tracked::new(i, counter.clone()))) }.unwrap();
         }
         let c1 = buffer.clone();
         let c2 = buffer.clone();
@@ -221,9 +217,7 @@ mod tests_atomic_buffer {
         {
             let buffer = AtomicBuffer::new();
             for i in 0..10 {
-                buffer
-                    .push(to_raw(Tracked::new(i, counter.clone())))
-                    .unwrap();
+                unsafe { buffer.push(to_raw(Tracked::new(i, counter.clone()))) }.unwrap();
             }
             assert_eq!(counter.load(Ordering::SeqCst), 10);
             // Buffer drops e libera gli elementi
@@ -244,9 +238,7 @@ mod tests_atomic_buffer {
 
         for round in 0..5 {
             for i in 0..4 {
-                buffer
-                    .push(Box::into_raw(Box::new((round * 4 + i) as i32)))
-                    .unwrap();
+                unsafe { buffer.push(Box::into_raw(Box::new((round * 4 + i) as i32))) }.unwrap();
             }
             for _ in 0..4 {
                 unsafe { drop_raw(buffer.pop().unwrap()) };
@@ -262,9 +254,7 @@ mod tests_atomic_buffer {
 
         for cycle in 0..10 {
             for i in 0..5 {
-                buffer
-                    .push(Box::into_raw(Box::new(cycle * 10 + i)))
-                    .unwrap();
+                unsafe { buffer.push(Box::into_raw(Box::new(cycle * 10 + i))) }.unwrap();
             }
             for _ in 0..3 {
                 unsafe { drop_raw(buffer.pop().unwrap()) };
@@ -285,10 +275,10 @@ mod tests_atomic_buffer {
         let buffer = AtomicBuffer::<i32>::with_capacity(1);
 
         let val = Box::into_raw(Box::new(42));
-        assert!(buffer.push(val).is_ok());
+        assert!(unsafe { buffer.push(val) }.is_ok());
 
         let overflow = Box::into_raw(Box::new(99));
-        let err = buffer.push(overflow).unwrap_err();
+        let err = unsafe { buffer.push(overflow) }.unwrap_err();
         unsafe { drop_raw(err) };
 
         unsafe { drop_raw(buffer.pop().unwrap()) };
@@ -305,7 +295,7 @@ mod tests_atomic_buffer {
         let producer = thread::spawn(move || {
             for i in 0..items {
                 let val = Box::into_raw(Box::new(i as i32));
-                while prod_buffer.push(val).is_err() {
+                while unsafe { prod_buffer.push(val) }.is_err() {
                     thread::yield_now();
                 }
             }
@@ -343,7 +333,7 @@ mod tests_atomic_buffer {
                     b.wait();
                     for i in 0..items_per_thread {
                         let val = Box::into_raw(Box::new((t * 100 + i) as i32));
-                        while buf.push(val).is_err() {
+                        while unsafe { buf.push(val) }.is_err() {
                             thread::yield_now();
                         }
                     }
@@ -367,7 +357,7 @@ mod tests_atomic_buffer {
         let buffer = Arc::new(AtomicBuffer::<i32>::with_capacity(32));
 
         for i in 0..32 {
-            buffer.push(Box::into_raw(Box::new(i))).unwrap();
+            unsafe { buffer.push(Box::into_raw(Box::new(i))) }.unwrap();
         }
 
         let barrier = Arc::new(Barrier::new(4));
@@ -400,9 +390,7 @@ mod tests_atomic_buffer {
         let buffer = Arc::new(AtomicBuffer::new());
 
         for i in 0..8 {
-            buffer
-                .push(to_raw(Tracked::new(i, counter.clone())))
-                .unwrap();
+            unsafe { buffer.push(to_raw(Tracked::new(i, counter.clone()))) }.unwrap();
         }
 
         let barrier = Arc::new(Barrier::new(8));
@@ -448,7 +436,7 @@ mod tests_atomic_buffer {
                     b.wait();
                     for i in 0..items_per_producer {
                         let ptr = to_raw(Tracked::new(t * items_per_producer + i, c.clone()));
-                        while buf.push(ptr).is_err() {
+                        while unsafe { buf.push(ptr) }.is_err() {
                             thread::yield_now();
                         }
                     }

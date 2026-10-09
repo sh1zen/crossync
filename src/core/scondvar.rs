@@ -1,11 +1,11 @@
-use crate::core::futex::{futex_wait, futex_wake, futex_wake_all};
+use crate::core::futex::{Futex, futex_wait, futex_wake, futex_wake_all};
 use crate::core::smutex::SGuard;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub struct SCondVar {
-    futex: AtomicUsize,  // For futex_wait/wake
+    futex: Futex, // For futex_wait/wake
     pub(crate) waiters: AtomicUsize,
     pub(crate) to_wake: AtomicUsize,
 }
@@ -13,7 +13,7 @@ pub struct SCondVar {
 impl SCondVar {
     pub const fn new() -> Self {
         Self {
-            futex: AtomicUsize::new(0),
+            futex: Futex::new(0),
             waiters: AtomicUsize::new(0),
             to_wake: AtomicUsize::new(0),
         }

@@ -28,9 +28,9 @@ pub struct Mpmc<T> {
 
 // SAFETY:
 // - `Mpmc` is `Send` if T is `Send`
-// - `Mpmc` is `Sync` if T is `Sync`
+// - `Mpmc` is `Sync` if T is `Send`: receiving transfers ownership between threads
 unsafe impl<T: Send> Send for Mpmc<T> {}
-unsafe impl<T: Sync> Sync for Mpmc<T> {}
+unsafe impl<T: Send> Sync for Mpmc<T> {}
 
 impl<T> Mpmc<T> {
     /// Creates a new **unbounded** MPMC channel
@@ -130,7 +130,7 @@ impl<T> Mpmc<T> {
 impl<T> Clone for Mpmc<T> {
     /// Clones the channel handle (increments refcount)
     fn clone(&self) -> Self {
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::increment_ref_count(&self.inner().ref_count);
         Self { ptr: self.ptr }
     }
 }

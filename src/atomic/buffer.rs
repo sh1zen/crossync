@@ -1,260 +1,240 @@
 use crate::sync::Backoff;
 use crossbeam_utils::CachePadded;
+use std::cell::UnsafeCell;
 use std::ptr;
-use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
 
+struct Slot<T> {
+    sequence: AtomicUsize,
+    value: UnsafeCell<*mut T>,
+}
+impl<T> Drop for Slot<T> {
+    fn drop(&mut self) {
+        let value = *self.value.get_mut();
+        if !value.is_null() {
+            unsafe {
+                drop(Box::from_raw(value));
+            }
+        }
+    }
+}
 struct AtomicBufferInner<T> {
-    // Hot path: separate cache lines for producer and consumer
-    head: CachePadded<AtomicUsize>,  // Consumer side
-    tail: CachePadded<AtomicUsize>,  // Producer side
-    slots: Box<[CachePadded<AtomicPtr<T>>]>,
-    // Cold data
-    ref_count: CachePadded<AtomicUsize>,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
+    slots: Box<[Slot<T>]>,
+    single: AtomicPtr<T>,
+    ref_count: AtomicUsize,
     cap: usize,
-    cap_mask: usize,
+}
+impl<T> Drop for AtomicBufferInner<T> {
+    fn drop(&mut self) {
+        let value = *self.single.get_mut();
+        if !value.is_null() {
+            unsafe {
+                drop(Box::from_raw(value));
+            }
+        }
+    }
 }
 
-unsafe impl<T: Send> Send for AtomicBuffer<T> {}
-unsafe impl<T: Send> Sync for AtomicBuffer<T> {}
-
+/// Bounded MPMC queue owning transferred allocations. Per-slot sequence
+/// numbers distinguish successive ring generations. A stalled reservation
+/// may delay other operations; this queue does not promise lock-free progress.
 #[repr(transparent)]
 pub struct AtomicBuffer<T> {
     inner: *const AtomicBufferInner<T>,
 }
+unsafe impl<T: Send> Send for AtomicBuffer<T> {}
+unsafe impl<T: Send> Sync for AtomicBuffer<T> {}
 
 impl<T> AtomicBuffer<T> {
     pub fn new() -> Self {
         Self::with_capacity(32)
     }
-
     pub fn with_capacity(cap: usize) -> Self {
         assert!(cap.is_power_of_two(), "capacity must be power of two");
-
-        // Pre-allocate with exact capacity, avoid reallocation
-        let slots: Box<[_]> = (0..cap)
-            .map(|_| CachePadded::new(AtomicPtr::new(ptr::null_mut())))
+        assert!(cap <= isize::MAX as usize, "capacity is too large");
+        let slots = (0..cap)
+            .map(|i| Slot {
+                sequence: AtomicUsize::new(i),
+                value: UnsafeCell::new(ptr::null_mut()),
+            })
             .collect();
-
-        let inner = AtomicBufferInner {
-            head: CachePadded::new(AtomicUsize::new(0)),
-            tail: CachePadded::new(AtomicUsize::new(0)),
-            slots,
-            ref_count: CachePadded::new(AtomicUsize::new(1)),
-            cap,
-            cap_mask: cap - 1,
-        };
-
         Self {
-            inner: Box::into_raw(Box::new(inner)),
+            inner: Box::into_raw(Box::new(AtomicBufferInner {
+                head: CachePadded::new(AtomicUsize::new(0)),
+                tail: CachePadded::new(AtomicUsize::new(0)),
+                slots,
+                single: AtomicPtr::new(ptr::null_mut()),
+                ref_count: AtomicUsize::new(1),
+                cap,
+            })),
         }
     }
-
     #[inline(always)]
     fn inner(&self) -> &AtomicBufferInner<T> {
-        // SAFETY: inner is always valid while AtomicBuffer exists
         unsafe { &*self.inner }
     }
 
-    /// Get slot without bounds checking (index is always masked)
-    #[inline(always)]
-    unsafe fn slot_unchecked(&self, idx: usize) -> &CachePadded<AtomicPtr<T>> {
-        unsafe {
-            self.inner().slots.get_unchecked(idx)
-        }
-    }
-
+    /// Transfers ownership on success. Null is rejected without reserving space.
+    ///
+    /// # Safety
+    /// A non-null pointer must come from Box::into_raw or an equivalent allocation
+    /// and have unique ownership. After success it must not be accessed or freed
+    /// until returned by pop/drain. On failure the caller retains ownership.
+    ///
+    /// ```compile_fail
+    /// let buffer = crossync::atomic::AtomicBuffer::new();
+    /// buffer.push(Box::into_raw(Box::new(1)));
+    /// ```
     #[inline]
-    pub fn push(&self, ptr: *mut T) -> Result<(), *mut T> {
+    pub unsafe fn push(&self, value: *mut T) -> Result<(), *mut T> {
+        if value.is_null() {
+            return Err(value);
+        }
         let inner = self.inner();
-
+        if inner.cap == 1 {
+            return inner
+                .single
+                .compare_exchange(ptr::null_mut(), value, Ordering::Release, Ordering::Relaxed)
+                .map(|_| ())
+                .map_err(|_| value);
+        }
+        let backoff = Backoff::new();
+        let mut pos = inner.tail.load(Ordering::Relaxed);
         loop {
-            let tail = inner.tail.load(Ordering::Relaxed);
-            let head = inner.head.load(Ordering::Acquire);
-
-            if tail.wrapping_sub(head) >= inner.cap {
-                return Err(ptr);
-            }
-
-            // Riserva lo slot con CAS su tail
-            if inner.tail.compare_exchange_weak(
-                tail,
-                tail.wrapping_add(1),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ).is_err() {
-                continue; // Altro producer ha vinto, riprova
-            }
-
-            // Ora abbiamo riservato slot[tail]
-            let idx = tail & inner.cap_mask;
-            let slot = unsafe { self.slot_unchecked(idx) };
-            let backoff = Backoff::new();
-
-            // Scrivi il valore (lo slot potrebbe non essere ancora vuoto
-            // se un consumer è lento)
-            loop {
-                match slot.compare_exchange_weak(
-                    ptr::null_mut(),
-                    ptr,
-                    Ordering::Release,
+            let slot = &inner.slots[pos & (inner.cap - 1)];
+            let seq = slot.sequence.load(Ordering::Acquire);
+            let diff = seq.wrapping_sub(pos) as isize;
+            if diff == 0 {
+                match inner.tail.compare_exchange_weak(
+                    pos,
+                    pos.wrapping_add(1),
+                    Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => return Ok(()),
-                    Err(_) => backoff.snooze(),
+                    Ok(_) => {
+                        unsafe {
+                            *slot.value.get() = value;
+                        }
+                        slot.sequence.store(pos.wrapping_add(1), Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(current) => pos = current,
                 }
+            } else if diff < 0 {
+                return Err(value);
+            } else {
+                pos = inner.tail.load(Ordering::Relaxed);
             }
+            backoff.spin();
         }
     }
-
+    /// Safe ownership transfer without raw pointers.
+    #[inline]
+    pub fn push_box(&self, value: Box<T>) -> Result<(), Box<T>> {
+        unsafe {
+            self.push(Box::into_raw(value))
+                .map_err(|p| Box::from_raw(p))
+        }
+    }
+    /// Returns unique ownership of the oldest allocation.
     #[inline]
     pub fn pop(&self) -> Option<*mut T> {
         let inner = self.inner();
-
+        if inner.cap == 1 {
+            let value = inner.single.swap(ptr::null_mut(), Ordering::Acquire);
+            return (!value.is_null()).then_some(value);
+        }
+        let backoff = Backoff::new();
+        let mut pos = inner.head.load(Ordering::Relaxed);
         loop {
-            let head = inner.head.load(Ordering::Relaxed);
-            let tail = inner.tail.load(Ordering::Acquire);
-
-            if head == tail {
-                return None;
-            }
-
-            // Riserva lo slot con CAS su head
-            if inner.head.compare_exchange_weak(
-                head,
-                head.wrapping_add(1),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ).is_err() {
-                continue;
-            }
-
-            let idx = head & inner.cap_mask;
-            let slot = unsafe { self.slot_unchecked(idx) };
-            let backoff = Backoff::new();
-
-            // Leggi il valore (potrebbe non essere ancora scritto)
-            loop {
-                let val = slot.swap(ptr::null_mut(), Ordering::Acquire);
-                if !val.is_null() {
-                    return Some(val);
+            let slot = &inner.slots[pos & (inner.cap - 1)];
+            let seq = slot.sequence.load(Ordering::Acquire);
+            let diff = seq.wrapping_sub(pos.wrapping_add(1)) as isize;
+            if diff == 0 {
+                match inner.head.compare_exchange_weak(
+                    pos,
+                    pos.wrapping_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let value = unsafe { ptr::replace(slot.value.get(), ptr::null_mut()) };
+                        slot.sequence
+                            .store(pos.wrapping_add(inner.cap), Ordering::Release);
+                        return Some(value);
+                    }
+                    Err(current) => pos = current,
                 }
+            } else if diff < 0 {
+                if inner.tail.load(Ordering::Acquire) == pos {
+                    return None;
+                }
+                pos = inner.head.load(Ordering::Relaxed);
                 backoff.snooze();
+            } else {
+                pos = inner.head.load(Ordering::Relaxed);
             }
         }
     }
-
-    /// Try pop without advancing head - useful for peek-like operations
+    #[inline]
+    pub fn pop_box(&self) -> Option<Box<T>> {
+        self.pop().map(|p| unsafe { Box::from_raw(p) })
+    }
     #[inline]
     pub fn try_pop_weak(&self) -> Option<*mut T> {
-        let inner = self.inner();
-        let head = inner.head.load(Ordering::Relaxed);
-        let tail = inner.tail.load(Ordering::Relaxed);
-
-        if head == tail {
-            return None;
-        }
-
-        let idx = head & inner.cap_mask;
-        let slot = unsafe { self.slot_unchecked(idx) };
-        let val = slot.swap(ptr::null_mut(), Ordering::Acquire);
-
-        if !val.is_null() {
-            inner.head.store(head.wrapping_add(1), Ordering::Release);
-            Some(val)
-        } else {
-            None
-        }
+        self.pop()
     }
-
-    #[inline(always)]
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.inner().cap
     }
-
-    /// Fast check if buffer appears empty (may have false negatives under contention)
-    #[inline(always)]
+    #[inline]
     pub fn is_empty_fast(&self) -> bool {
-        let inner = self.inner();
-        inner.head.load(Ordering::Relaxed) == inner.tail.load(Ordering::Relaxed)
+        self.len_approx() == 0
     }
-
-    /// Approximate length (may be slightly off under contention)
+    /// Approximate size under contention, always bounded by capacity.
     #[inline]
     pub fn len_approx(&self) -> usize {
         let inner = self.inner();
-        let tail = inner.tail.load(Ordering::Relaxed);
-        let head = inner.head.load(Ordering::Relaxed);
-        tail.wrapping_sub(head)
-    }
-
-    pub fn drain_all(&self) -> impl Iterator<Item = *mut T> + '_ {
-        let inner = self.inner();
-
-        // Reset completo degli indici
-        inner.head.store(0, Ordering::Relaxed);
-        inner.tail.store(0, Ordering::Release);
-
-        inner.slots.iter().filter_map(|slot| {
-            let ptr = slot.swap(ptr::null_mut(), Ordering::Acquire);
-            if ptr.is_null() { None } else { Some(ptr) }
-        })
-    }
-
-    /// Batch drain with pre-allocated vector - more efficient for large drains
-    #[inline]
-    pub fn drain_to_vec(&self) -> Vec<*mut T> {
-        let inner = self.inner();
-        let mut result = Vec::with_capacity(inner.cap);
-
-        for slot in inner.slots.iter() {
-            let ptr = slot.swap(ptr::null_mut(), Ordering::Acquire);
-            if !ptr.is_null() {
-                result.push(ptr);
-            }
+        if inner.cap == 1 {
+            return usize::from(!inner.single.load(Ordering::Relaxed).is_null());
         }
-        result
+        let head = inner.head.load(Ordering::Relaxed);
+        inner
+            .tail
+            .load(Ordering::Relaxed)
+            .wrapping_sub(head)
+            .min(inner.cap)
+    }
+    /// Lazily removes up to capacity entries; dropping the iterator preserves
+    /// unconsumed entries and their ownership in the queue.
+    pub fn drain_all(&self) -> impl Iterator<Item = *mut T> + '_ {
+        std::iter::from_fn(move || self.pop()).take(self.capacity())
+    }
+    pub fn drain_to_vec(&self) -> Vec<*mut T> {
+        self.drain_all().collect()
     }
 }
-
 impl<T> Default for AtomicBuffer<T> {
-    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl<T> Clone for AtomicBuffer<T> {
-    #[inline]
     fn clone(&self) -> Self {
-        // Relaxed is sufficient for increment - we don't need to synchronize data
-        // The synchronization happens in Drop via the Acquire fence
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::increment_ref_count(&self.inner().ref_count);
         Self { inner: self.inner }
     }
 }
-
 impl<T> Drop for AtomicBuffer<T> {
     fn drop(&mut self) {
-        let inner = unsafe { &*self.inner };
-
-        // Release: ensure all our writes are visible before potential deallocation
-        if inner.ref_count.fetch_sub(1, Ordering::Release) != 1 {
-            return;
-        }
-
-        // Acquire fence: synchronize with all Release decrements from other threads
-        fence(Ordering::Acquire);
-
-        // Free all stored elements
-        for slot in inner.slots.iter() {
-            let ptr = slot.load(Ordering::Relaxed);
-            if !ptr.is_null() {
-                unsafe { drop(Box::from_raw(ptr)) };
+        if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
+            fence(Ordering::Acquire);
+            unsafe {
+                drop(Box::from_raw(self.inner.cast_mut()));
             }
-        }
-
-        unsafe {
-            drop(Box::from_raw(self.inner as *mut AtomicBufferInner<T>));
         }
     }
 }

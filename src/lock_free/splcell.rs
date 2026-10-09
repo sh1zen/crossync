@@ -36,7 +36,7 @@ fn readers_count(state: State) -> usize {
 }
 
 unsafe impl<T: Send> Send for SpinCell<T> {}
-unsafe impl<T: Send> Sync for SpinCell<T> {}
+unsafe impl<T: Send + Sync> Sync for SpinCell<T> {}
 
 impl<T> SpinCell<T> {
     /// Create a new SplLock instance with reference count = 1
@@ -90,33 +90,19 @@ impl<T> SpinCell<T> {
     }
 
     /// Release the exclusive lock
-    pub fn unlock_exclusive(&self) {
-        // Fast path: release without waking other threads
-        if self
-            .state
-            .compare_exchange(ONE_WRITER, UNLOCKED, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-        let state = self.state.load(Ordering::Relaxed);
-
-        let parked = state & (READERS_PARKED | WRITERS_PARKED);
-
-        if parked & READERS_PARKED != 0 {
-            // Case 1: readers are waiting (possibly also writers)
-            self.state.store(
-                if parked & WRITERS_PARKED != 0 {
-                    WRITERS_PARKED
-                } else {
-                    UNLOCKED
-                },
-                Ordering::Release,
-            );
-        } else if parked & WRITERS_PARKED != 0 {
-            // Case 2: only writers are waiting
-            self.state.store(UNLOCKED, Ordering::Release);
-        }
+    /// # Safety
+    /// The caller owns the exclusive acquisition and will not use or drop its guard again.
+    ///
+    /// ```compile_fail
+    /// let cell = crossync::lock_free::SpinCell::new(1);
+    /// let guard = cell.lock_exclusive();
+    /// cell.unlock_exclusive();
+    /// ```
+    pub unsafe fn unlock_exclusive(&self) {
+        // Waiters spin and recheck state. A boolean parked flag may belong to
+        // this very writer, so retaining it could strand readers with no
+        // remaining writer to clear it.
+        self.state.store(UNLOCKED, Ordering::Release);
     }
 
     fn lock_exclusive_slow(&self) -> ExclusiveGuard<'_, T> {
@@ -145,7 +131,7 @@ impl<T> SpinCell<T> {
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => state |= WRITERS_PARKED,
+                    Ok(_) => {}
                     Err(e) => {
                         state = e;
                         continue;
@@ -164,7 +150,7 @@ impl<T> SpinCell<T> {
         let state = self.state.load(Ordering::Relaxed);
 
         if let Some(new_state) = state.checked_add(ONE_READER) {
-            if new_state & ONE_WRITER != ONE_WRITER {
+            if new_state & ONE_WRITER != ONE_WRITER && state & WRITERS_PARKED == 0 {
                 if self
                     .state
                     .compare_exchange(state, new_state, Ordering::Acquire, Ordering::Relaxed)
@@ -189,7 +175,12 @@ impl<T> SpinCell<T> {
                 if let Some(new_state) = state.checked_add(ONE_READER) {
                     if self
                         .state
-                        .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
+                        .compare_exchange_weak(
+                            state,
+                            new_state,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        )
                         .is_ok()
                     {
                         return SharedGuard { lock: self };
@@ -230,7 +221,9 @@ impl<T> SpinCell<T> {
     }
 
     #[inline]
-    pub fn unlock_shared(&self) {
+    /// # Safety
+    /// The caller owns one shared acquisition and will not use or drop its guard again.
+    pub unsafe fn unlock_shared(&self) {
         let prev_state = self.state.fetch_sub(ONE_READER, Ordering::Release);
 
         // If last reader and writers are waiting, wake one writer
@@ -245,7 +238,9 @@ impl<T> SpinCell<T> {
     }
 
     #[inline]
-    pub fn unlock_all_shared(&self) {
+    /// # Safety
+    /// The caller owns every shared acquisition and no corresponding guard may be used or dropped again.
+    pub unsafe fn unlock_all_shared(&self) {
         loop {
             let state = self.state.load(Ordering::Acquire);
             let readers_count = readers_count(state);
@@ -294,7 +289,9 @@ impl<'a, T> DerefMut for ExclusiveGuard<'a, T> {
 impl<'a, T> Drop for ExclusiveGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.unlock_exclusive();
+        unsafe {
+            self.lock.unlock_exclusive();
+        }
     }
 }
 
@@ -315,7 +312,9 @@ impl<'a, T> Deref for SharedGuard<'a, T> {
 impl<'a, T> Drop for SharedGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.unlock_shared();
+        unsafe {
+            self.lock.unlock_shared();
+        }
     }
 }
 

@@ -1,6 +1,8 @@
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::AtomicU32;
 
-pub(crate) type Futex = AtomicUsize;
+// Linux/FreeBSD wait on exactly 32 bits. Keep Rust and OS atomic accesses the
+// same width; aliasing part of an AtomicUsize/U64 can create mixed-size races.
+pub(crate) type Futex = AtomicU32;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[path = "linux.rs"]
@@ -21,28 +23,28 @@ mod platform;
 /// If atomic and value matches, wait until woken up.
 /// This function might also return spuriously. Handle that case.
 #[inline]
-pub(crate) fn futex_wait(atomic: &AtomicUsize, value: usize) {
+pub(crate) fn futex_wait(atomic: &AtomicU32, value: u32) {
     platform::wait(atomic, value)
 }
 
 /// Wake one thread that is waiting on this atomic.
 /// It's okay if the pointer dangles or is null.
 #[inline]
-pub(crate) fn futex_wake(atomic: *const AtomicUsize) {
+pub(crate) fn futex_wake(atomic: *const AtomicU32) {
     platform::wake_one(atomic);
 }
 
 /// Wake all threads that are waiting on this atomic.
 /// It's okay if the pointer dangles or is null.
 #[inline]
-pub(crate) fn futex_wake_all(atomic: *const AtomicUsize) {
+pub(crate) fn futex_wake_all(atomic: *const AtomicU32) {
     platform::wake_all(atomic);
 }
 
 #[cfg(test)]
 mod tests_futex {
     use crate::core::futex::{futex_wait, futex_wake, futex_wake_all};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -52,13 +54,13 @@ mod tests_futex {
     #[test]
     fn test_wake_null_pointer() {
         // Non deve crashare con puntatore nullo
-        futex_wake(std::ptr::null::<AtomicUsize>());
-        futex_wake_all(std::ptr::null::<AtomicUsize>());
+        futex_wake(std::ptr::null::<AtomicU32>());
+        futex_wake_all(std::ptr::null::<AtomicU32>());
     }
 
     #[test]
     fn test_wake_no_waiters() {
-        let a = AtomicUsize::new(0);
+        let a = AtomicU32::new(0);
 
         // Wake senza thread in attesa - non deve bloccare o crashare
         futex_wake(&a);
@@ -69,8 +71,8 @@ mod tests_futex {
     fn test_wake_dangling_safe() {
         // Simula puntatore "dangling" (non nullo ma non valido)
         // In pratica usiamo un indirizzo stack che non ha waiters
-        let a = AtomicUsize::new(42);
-        let ptr = &a as *const AtomicUsize;
+        let a = AtomicU32::new(42);
+        let ptr = &a as *const AtomicU32;
 
         futex_wake(ptr);
     }
@@ -79,7 +81,7 @@ mod tests_futex {
 
     #[test]
     fn test_wait_value_mismatch_returns_immediately() {
-        let a = AtomicUsize::new(0);
+        let a = AtomicU32::new(0);
 
         let start = Instant::now();
         // Valore non corrisponde -> ritorna subito
@@ -94,9 +96,9 @@ mod tests_futex {
 
     #[test]
     fn test_wait_value_mismatch_various() {
-        let a = AtomicUsize::new(100);
+        let a = AtomicU32::new(100);
 
-        for wrong_value in [0, 1, 50, 99, 101, usize::MAX] {
+        for wrong_value in [0, 1, 50, 99, 101, u32::MAX] {
             let start = Instant::now();
             futex_wait(&a, wrong_value);
             assert!(start.elapsed() < Duration::from_millis(50));
@@ -107,8 +109,8 @@ mod tests_futex {
 
     #[test]
     fn test_wake_one_wakes_waiter() {
-        let a = Arc::new(AtomicUsize::new(0));
-        let woken = Arc::new(AtomicUsize::new(0));
+        let a = Arc::new(AtomicU32::new(0));
+        let woken = Arc::new(AtomicU32::new(0));
 
         let a2 = a.clone();
         let w = woken.clone();
@@ -131,8 +133,8 @@ mod tests_futex {
 
     #[test]
     fn test_wake_all_wakes_multiple() {
-        let a = Arc::new(AtomicUsize::new(0));
-        let woken_count = Arc::new(AtomicUsize::new(0));
+        let a = Arc::new(AtomicU32::new(0));
+        let woken_count = Arc::new(AtomicU32::new(0));
         let barrier = Arc::new(Barrier::new(5)); // 4 waiters + 1 waker
 
         let handles: Vec<_> = (0..4)
@@ -165,8 +167,8 @@ mod tests_futex {
 
     #[test]
     fn test_wake_one_wakes_only_one() {
-        let a = Arc::new(AtomicUsize::new(0));
-        let woken_count = Arc::new(AtomicUsize::new(0));
+        let a = Arc::new(AtomicU32::new(0));
+        let woken_count = Arc::new(AtomicU32::new(0));
         let barrier = Arc::new(Barrier::new(4)); // 3 waiters + 1 controller
 
         let handles: Vec<_> = (0..3)
@@ -210,7 +212,7 @@ mod tests_futex {
 
     #[test]
     fn test_wait_wake_timing() {
-        let a = Arc::new(AtomicUsize::new(0));
+        let a = Arc::new(AtomicU32::new(0));
 
         let a2 = a.clone();
         let start = Instant::now();
@@ -237,8 +239,8 @@ mod tests_futex {
 
     #[test]
     fn test_producer_consumer_pattern() {
-        let state = Arc::new(AtomicUsize::new(0));
-        let consumed = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(AtomicU32::new(0));
+        let consumed = Arc::new(AtomicU32::new(0));
 
         let s = state.clone();
         let c = consumed.clone();
@@ -268,8 +270,8 @@ mod tests_futex {
 
     #[test]
     fn test_flag_pattern() {
-        let flag = Arc::new(AtomicUsize::new(0));
-        let completed = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::new(AtomicU32::new(0));
+        let completed = Arc::new(AtomicU32::new(0));
 
         // Thread che aspetta il flag
         let f = flag.clone();
@@ -294,7 +296,7 @@ mod tests_futex {
 
     #[test]
     fn test_counter_pattern() {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(AtomicU32::new(0));
         let barrier = Arc::new(Barrier::new(5));
 
         let handles: Vec<_> = (0..4)
@@ -326,7 +328,7 @@ mod tests_futex {
 
     #[test]
     fn test_rapid_wait_wake() {
-        let a = Arc::new(AtomicUsize::new(0));
+        let a = Arc::new(AtomicU32::new(0));
 
         for i in 0..50 {
             let a2 = a.clone();
@@ -345,8 +347,8 @@ mod tests_futex {
 
     #[test]
     fn test_multiple_atomics() {
-        let a1 = Arc::new(AtomicUsize::new(0));
-        let a2 = Arc::new(AtomicUsize::new(0));
+        let a1 = Arc::new(AtomicU32::new(0));
+        let a2 = Arc::new(AtomicU32::new(0));
 
         let a1c = a1.clone();
         let a2c = a2.clone();
@@ -378,12 +380,12 @@ mod tests_futex {
 
     #[test]
     fn test_value_boundaries() {
-        let a = AtomicUsize::new(usize::MAX);
+        let a = AtomicU32::new(u32::MAX);
 
         // Wait con valore che non corrisponde
         let start = Instant::now();
         futex_wait(&a, 0);
-        futex_wait(&a, usize::MAX - 1);
+        futex_wait(&a, u32::MAX - 1);
         assert!(start.elapsed() < Duration::from_millis(50));
 
         // Wait con valore che corrisponde (potrebbe bloccare brevemente o spurious return)
@@ -392,7 +394,7 @@ mod tests_futex {
 
     #[test]
     fn test_zero_value() {
-        let a = AtomicUsize::new(0);
+        let a = AtomicU32::new(0);
 
         // Wake su valore 0
         futex_wake(&a);

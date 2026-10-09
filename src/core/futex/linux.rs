@@ -1,42 +1,54 @@
-use core::sync::atomic::AtomicUsize;
-use std::sync::atomic::AtomicU32;
+use core::sync::atomic::AtomicU32;
 
 #[inline]
-pub fn wait(a: &AtomicUsize, expected: usize) {
-    let ptr: *const AtomicU32 = (a as *const AtomicUsize) as *const AtomicU32;
-    let expected_ptr: *const u32 = &(expected as u32);
+fn word(ptr: *const AtomicU32) -> *mut u32 {
+    let ptr = ptr.cast_mut().cast::<u32>();
+    ptr
+}
+
+#[inline]
+pub(super) fn wait(a: &AtomicU32, expected: u32) {
+    let ptr = word(a);
 
     unsafe {
         libc::syscall(
             libc::SYS_futex,
             ptr,
             libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-            expected_ptr,
+            expected as u32,
+            core::ptr::null::<libc::timespec>(),
+            core::ptr::null_mut::<u32>(),
             0u32,
         );
     };
 }
 
 #[inline]
-pub fn wake_one(ptr: *const AtomicUsize) {
+pub(super) fn wake_one(ptr: *const AtomicU32) {
     unsafe {
         libc::syscall(
             libc::SYS_futex,
-            ptr as *const AtomicU32,
+            word(ptr),
             libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
             1u32,
+            core::ptr::null::<libc::timespec>(),
+            core::ptr::null_mut::<u32>(),
+            0u32,
         );
     };
 }
 
 #[inline]
-pub fn wake_all(ptr: *const AtomicUsize) {
+pub(super) fn wake_all(ptr: *const AtomicU32) {
     unsafe {
         libc::syscall(
             libc::SYS_futex,
-            ptr as *const AtomicU32,
+            word(ptr),
             libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-            u32::MAX,
+            i32::MAX as u32,
+            core::ptr::null::<libc::timespec>(),
+            core::ptr::null_mut::<u32>(),
+            0u32,
         );
     };
 }

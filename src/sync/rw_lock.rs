@@ -31,7 +31,7 @@ pub struct RwLock<T> {
 }
 
 // MutexCell is Send/Sync if T is Send/Sync
-unsafe impl<T: Send> Send for RwLock<T> {}
+unsafe impl<T: Send + Sync> Send for RwLock<T> {}
 unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
 impl<T> RwLock<T> {
@@ -121,7 +121,7 @@ impl<T> RwLock<T> {
 
 impl<T> Clone for RwLock<T> {
     fn clone(&self) -> Self {
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::increment_ref_count(&self.inner().ref_count);
         RwLock { ptr: self.ptr }
     }
 }

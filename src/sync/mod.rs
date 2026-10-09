@@ -1,4 +1,5 @@
 mod barrier;
+mod guard_lock;
 mod watch_guard_mut;
 mod watch_guard_ref;
 mod rw_lock;

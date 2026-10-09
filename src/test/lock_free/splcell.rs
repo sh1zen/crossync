@@ -1,7 +1,7 @@
 mod tests_spincell {
     use crate::lock_free::SpinCell;
-    use std::sync::{Arc, Barrier};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::thread;
     // ==================== CONSTRUCTION & STATE ====================
 
@@ -124,7 +124,9 @@ mod tests_spincell {
         std::mem::forget(g3);
 
         // unlock_all_shared deve rilasciare tutti i lock
-        cell.unlock_all_shared();
+        unsafe {
+            cell.unlock_all_shared();
+        }
         assert_eq!(cell.get_shared_locked(), 0);
         assert!(!cell.is_locked());
     }

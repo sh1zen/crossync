@@ -1,10 +1,10 @@
+use crate::core::serial::SerialMutex;
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::ops::{Add, Sub, BitAnd, BitOr, BitXor};
-use crate::core::smutex::SMutex;
+use std::ops::{Add, BitAnd, BitOr, BitXor, Sub};
 
 /// A generic atomic type that provides thread-safe access to **ANY** type `T`.
-/// Uses `SMutex` internally for synchronization.
+/// Uses `SerialMutex` internally for synchronization.
 ///
 /// Unlike std atomics which only work with primitive types, this works with:
 /// - Primitives (bool, integers, floats)
@@ -12,11 +12,11 @@ use crate::core::smutex::SMutex;
 /// - Strings and collections
 /// - Any custom type
 pub struct Atomic<T> {
-    mutex: SMutex,
+    mutex: SerialMutex,
     value: UnsafeCell<T>,
 }
 
-// Safety: Atomic<T> can be shared across threads if T is Send
+// Reads are serialized between threads, including interior mutation through &T.
 unsafe impl<T: Send> Sync for Atomic<T> {}
 unsafe impl<T: Send> Send for Atomic<T> {}
 
@@ -25,7 +25,7 @@ impl<T> Atomic<T> {
     /// Creates a new atomic value.
     pub fn new(value: T) -> Self {
         Self {
-            mutex: SMutex::new(),
+            mutex: SerialMutex::new(),
             value: UnsafeCell::new(value),
         }
     }
@@ -47,7 +47,7 @@ impl<T> Atomic<T> {
     where
         F: FnOnce(&T) -> R,
     {
-        let _guard = self.mutex.lock_group();
+        let _guard = self.mutex.read_guard();
         unsafe { f(&*self.value.get()) }
     }
 
@@ -57,7 +57,7 @@ impl<T> Atomic<T> {
     where
         F: FnOnce(&mut T) -> R,
     {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe { f(&mut *self.value.get()) }
     }
 
@@ -67,12 +67,10 @@ impl<T> Atomic<T> {
     where
         F: FnOnce(&T) -> T,
     {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
-            let old = std::ptr::read(self.value.get());
-            let new = f(&old);
-            std::ptr::write(self.value.get(), new);
-            old
+            let new = f(&*self.value.get());
+            std::mem::replace(&mut *self.value.get(), new)
         }
     }
 
@@ -82,7 +80,7 @@ impl<T> Atomic<T> {
     where
         F: FnOnce(&mut T),
     {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe { f(&mut *self.value.get()) }
     }
 
@@ -92,7 +90,7 @@ impl<T> Atomic<T> {
     where
         F: FnOnce(&mut T) -> bool,
     {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             if f(&mut *self.value.get()) {
                 Ok(())
@@ -107,26 +105,20 @@ impl<T> Atomic<T> {
 impl<T: Clone> Atomic<T> {
     /// Loads a clone of the value from the atomic.
     pub fn load(&self) -> T {
-        let _guard = self.mutex.lock_group();
+        let _guard = self.mutex.read_guard();
         unsafe { (*self.value.get()).clone() }
     }
 
     /// Stores a value into the atomic.
     pub fn store(&self, val: T) {
-        let _guard = self.mutex.lock();
-        unsafe {
-            *self.value.get() = val;
-        }
+        // Destructors may reenter the container after the replacement is visible.
+        drop(self.swap(val));
     }
 
     /// Swaps the value, returning the previous value.
     pub fn swap(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
-        unsafe {
-            let old = (*self.value.get()).clone();
-            *self.value.get() = val;
-            old
-        }
+        let _guard = self.mutex.write_guard();
+        unsafe { std::mem::replace(&mut *self.value.get(), val) }
     }
 
     /// Takes the value, replacing it with a default.
@@ -142,13 +134,13 @@ impl<T: Clone> Atomic<T> {
 impl<T: Copy> Atomic<T> {
     /// Loads a copy of the value (optimized for Copy types).
     pub fn load_copy(&self) -> T {
-        let _guard = self.mutex.lock_group();
+        let _guard = self.mutex.read_guard();
         unsafe { *self.value.get() }
     }
 
     /// Swaps the value, returning the previous value (optimized for Copy types).
     pub fn swap_copy(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = val;
@@ -162,7 +154,7 @@ impl<T: Clone + PartialEq> Atomic<T> {
     /// Stores a value if the current value is the same as `current`.
     /// Returns `Ok(old_value)` on success, `Err(current_value)` on failure.
     pub fn compare_exchange(&self, current: T, new: T) -> Result<T, T> {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let val = (*self.value.get()).clone();
             if val == current {
@@ -191,7 +183,7 @@ impl<T: Clone + PartialEq> Atomic<T> {
     where
         F: FnMut(&T) -> Option<T>,
     {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = (*self.value.get()).clone();
             if let Some(new) = f(&old) {
@@ -208,7 +200,7 @@ impl<T: Clone + PartialEq> Atomic<T> {
 impl<T: Copy + Add<Output = T>> Atomic<T> {
     /// Adds to the current value, returning the previous value.
     pub fn fetch_add(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = old + val;
@@ -220,7 +212,7 @@ impl<T: Copy + Add<Output = T>> Atomic<T> {
 impl<T: Copy + Sub<Output = T>> Atomic<T> {
     /// Subtracts from the current value, returning the previous value.
     pub fn fetch_sub(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = old - val;
@@ -233,7 +225,7 @@ impl<T: Copy + Sub<Output = T>> Atomic<T> {
 impl<T: Copy + BitAnd<Output = T>> Atomic<T> {
     /// Performs bitwise AND, returning the previous value.
     pub fn fetch_and_bits(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = old & val;
@@ -245,7 +237,7 @@ impl<T: Copy + BitAnd<Output = T>> Atomic<T> {
 impl<T: Copy + BitOr<Output = T>> Atomic<T> {
     /// Performs bitwise OR, returning the previous value.
     pub fn fetch_or_bits(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = old | val;
@@ -257,7 +249,7 @@ impl<T: Copy + BitOr<Output = T>> Atomic<T> {
 impl<T: Copy + BitXor<Output = T>> Atomic<T> {
     /// Performs bitwise XOR, returning the previous value.
     pub fn fetch_xor_bits(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = old ^ val;
@@ -269,7 +261,7 @@ impl<T: Copy + BitXor<Output = T>> Atomic<T> {
 impl<T: Copy + PartialOrd> Atomic<T> {
     /// Stores the maximum of the current value and `val`, returning the previous value.
     pub fn fetch_max(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             if val > old {
@@ -281,7 +273,7 @@ impl<T: Copy + PartialOrd> Atomic<T> {
 
     /// Stores the minimum of the current value and `val`, returning the previous value.
     pub fn fetch_min(&self, val: T) -> T {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             if val < old {
@@ -296,7 +288,7 @@ impl<T: Copy + PartialOrd> Atomic<T> {
 impl Atomic<bool> {
     /// Performs logical AND, returning the previous value.
     pub fn fetch_and(&self, val: bool) -> bool {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = old && val;
@@ -306,7 +298,7 @@ impl Atomic<bool> {
 
     /// Performs logical OR, returning the previous value.
     pub fn fetch_or(&self, val: bool) -> bool {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = old || val;
@@ -316,7 +308,7 @@ impl Atomic<bool> {
 
     /// Performs logical XOR, returning the previous value.
     pub fn fetch_xor(&self, val: bool) -> bool {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = old != val;
@@ -326,7 +318,7 @@ impl Atomic<bool> {
 
     /// Performs logical NAND, returning the previous value.
     pub fn fetch_nand(&self, val: bool) -> bool {
-        let _guard = self.mutex.lock();
+        let _guard = self.mutex.write_guard();
         unsafe {
             let old = *self.value.get();
             *self.value.get() = !(old && val);
@@ -342,7 +334,7 @@ macro_rules! impl_nand {
             impl Atomic<$t> {
                 /// Performs bitwise NAND, returning the previous value.
                 pub fn fetch_nand(&self, val: $t) -> $t {
-                    let _guard = self.mutex.lock();
+                    let _guard = self.mutex.write_guard();
                     unsafe {
                         let old = *self.value.get();
                         *self.value.get() = !(old & val);
@@ -354,7 +346,9 @@ macro_rules! impl_nand {
     };
 }
 
-impl_nand!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+impl_nand!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+);
 
 // String-specific operations
 impl Atomic<String> {
@@ -441,9 +435,7 @@ impl<T: Clone> Atomic<Option<T>> {
 impl<T: Clone + fmt::Debug> fmt::Debug for Atomic<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = self.load();
-        f.debug_struct("Atomic")
-            .field("value", &value)
-            .finish()
+        f.debug_struct("Atomic").field("value", &value).finish()
     }
 }
 

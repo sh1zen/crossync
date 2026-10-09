@@ -1,3 +1,5 @@
+use super::guard_lock::GuardLock;
+use crate::core::serial::SerialMutex;
 use crate::sync::RawMutex;
 use std::any::{Any, TypeId};
 use std::fmt::{Debug, Formatter};
@@ -9,7 +11,8 @@ use std::ops::{Deref, DerefMut};
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct WatchGuardMut<'a, T: ?Sized> {
     data: *mut T,
-    lock: *const RawMutex,
+    lock: GuardLock,
+    protection: *const RawMutex,
     marker: PhantomData<&'a mut T>,
 }
 
@@ -21,13 +24,30 @@ impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     pub(crate) fn new(ptr: *mut T, lock: *const RawMutex) -> WatchGuardMut<'mutex, T> {
         Self {
             data: ptr,
-            lock,
+            lock: GuardLock::exclusive(lock),
+            protection: std::ptr::null(),
             marker: PhantomData,
         }
     }
 
+    #[inline]
+    pub(crate) fn serial(ptr: *mut T, lock: *const SerialMutex) -> Self {
+        Self {
+            data: ptr,
+            lock: GuardLock::serial_write(lock),
+            protection: std::ptr::null(),
+            marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn protect(mut self, lock: *const RawMutex) -> Self {
+        self.protection = lock;
+        self
+    }
+
     pub fn is_locked(&self) -> bool {
-        unsafe { (*self.lock).is_locked_exclusive() }
+        unsafe { self.lock.is_locked() }
     }
 }
 
@@ -77,7 +97,12 @@ impl<'mutex, T: Sized> WatchGuardMut<'mutex, T> {
             // Safe only because we just checked that the type IDs match.
             let u_ptr = unsafe { &mut *(dyn_any_ref as *mut dyn Any as *mut U) };
 
-            Ok(WatchGuardMut::new(u_ptr, this.lock))
+            Ok(WatchGuardMut {
+                data: u_ptr,
+                lock: this.lock,
+                protection: this.protection,
+                marker: PhantomData,
+            })
         } else {
             Err(ManuallyDrop::into_inner(this))
         }
@@ -88,22 +113,14 @@ impl<T: ?Sized> Deref for WatchGuardMut<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        debug_assert!(
-            unsafe { (*self.lock).is_locked_exclusive() },
-            "{:?}",
-            unsafe { &*self.lock }
-        );
+        debug_assert!(unsafe { self.lock.is_locked() });
         unsafe { &*self.data }
     }
 }
 
 impl<T: ?Sized> DerefMut for WatchGuardMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        debug_assert!(
-            unsafe { (*self.lock).is_locked_exclusive() },
-            "{:?}",
-            unsafe { &*self.lock }
-        );
+        debug_assert!(unsafe { self.lock.is_locked() });
         unsafe { &mut *self.data }
     }
 }
@@ -111,7 +128,12 @@ impl<T: ?Sized> DerefMut for WatchGuardMut<'_, T> {
 impl<T: ?Sized> Drop for WatchGuardMut<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        unsafe { (*self.lock).unlock_exclusive() };
+        unsafe {
+            self.lock.unlock();
+            if !self.protection.is_null() {
+                (*self.protection).unlock_shared();
+            }
+        }
     }
 }
 
@@ -128,7 +150,7 @@ impl<'a, T: Debug> Debug for WatchGuardMut<'a, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WatchGuardMut")
             .field("data", &self.data)
-            .field("lock", &unsafe { &*self.lock })
+            .field("lock", &self.lock)
             .finish()
     }
 }

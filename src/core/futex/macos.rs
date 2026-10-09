@@ -1,6 +1,6 @@
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicUsize, Ordering::Relaxed},
+    sync::atomic::{AtomicU32, Ordering::Relaxed},
 };
 
 // On macOS, atomic wait/wake functionality is not available through
@@ -45,8 +45,8 @@ unsafe extern "C" {
 }
 
 #[inline]
-pub fn wait(a: &AtomicUsize, expected: usize) {
-    let ptr: *const AtomicUsize = a;
+pub(super) fn wait(a: &AtomicU32, expected: u32) {
+    let ptr: *const AtomicU32 = a;
     // The 'monitor' is just the notification counter associated
     // with the address of the atomic.
     let monitor = unsafe { __libcpp_atomic_monitor(ptr.cast()) };
@@ -60,11 +60,11 @@ pub fn wait(a: &AtomicUsize, expected: usize) {
 }
 
 #[inline]
-pub fn wake_one(ptr: *const AtomicUsize) {
+pub(super) fn wake_one(ptr: *const AtomicU32) {
     unsafe { __cxx_atomic_notify_one(ptr.cast()) };
 }
 
 #[inline]
-pub fn wake_all(ptr: *const AtomicUsize) {
+pub(super) fn wake_all(ptr: *const AtomicU32) {
     unsafe { __cxx_atomic_notify_all(ptr.cast()) };
 }

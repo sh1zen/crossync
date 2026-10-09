@@ -1,16 +1,16 @@
-use crate::core::futex::{futex_wait, futex_wake};
+use crate::core::futex::{Futex, futex_wait, futex_wake};
 use crossbeam_utils::CachePadded;
 use std::sync::atomic;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, Thread};
 
-type State = usize;
+type State = u32;
 
 const PARKED: State = 0;
 const UNPARKED: State = 1;
 
 struct ThreadInner {
-    tokens: CachePadded<AtomicUsize>,
+    tokens: CachePadded<Futex>,
     ref_count: CachePadded<AtomicUsize>,
     thread: Thread,
 }
@@ -18,7 +18,7 @@ struct ThreadInner {
 impl ThreadInner {
     fn new() -> Self {
         Self {
-            tokens: CachePadded::new(AtomicUsize::new(UNPARKED)),
+            tokens: CachePadded::new(Futex::new(UNPARKED)),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
             thread: thread::current(),
         }
@@ -27,16 +27,18 @@ impl ThreadInner {
     #[inline]
     fn try_consume_token(&self) -> bool {
         self.tokens
-            .fetch_update(Ordering::Acquire, Ordering::Acquire, |v| {
+            .try_update(Ordering::Acquire, Ordering::Acquire, |v| {
                 if v > PARKED { Some(v - 1) } else { None }
             })
             .is_ok()
     }
 
     #[inline]
-    fn add_token(&self) -> usize {
+    fn add_token(&self) -> u32 {
         // CORRECT: Release to publish the token
-        self.tokens.fetch_add(1, Ordering::Release)
+        self.tokens
+            .try_update(Ordering::Release, Ordering::Relaxed, |v| v.checked_add(1))
+            .expect("parker token count overflow")
     }
 }
 
@@ -100,7 +102,7 @@ impl ThreadParker {
 
 impl Clone for ThreadParker {
     fn clone(&self) -> Self {
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::increment_ref_count(&self.inner().ref_count);
         ThreadParker { ptr: self.ptr }
     }
 }

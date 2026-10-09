@@ -1,4 +1,4 @@
-use crate::core::futex::{futex_wait, futex_wake_all};
+use crate::core::futex::{Futex, futex_wait, futex_wake_all};
 use crate::sync::Backoff;
 use crossbeam_utils::CachePadded;
 use std::fmt;
@@ -44,10 +44,10 @@ struct InnerMutex {
     state: CachePadded<AtomicUsize>,
 
     /// Futex sequence number used for reader wait/wake
-    readers_futex: CachePadded<AtomicUsize>,
+    readers_futex: CachePadded<Futex>,
 
     /// Futex sequence number used for writer wait/wake
-    writers_futex: CachePadded<AtomicUsize>,
+    writers_futex: CachePadded<Futex>,
 
     /// Reference counter (atomic), for safe cloning and deallocation
     ref_count: CachePadded<AtomicUsize>,
@@ -59,8 +59,8 @@ impl InnerMutex {
         Self {
             state: CachePadded::new(AtomicUsize::new(0)),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
-            readers_futex: CachePadded::new(AtomicUsize::new(0)),
-            writers_futex: CachePadded::new(AtomicUsize::new(0)),
+            readers_futex: CachePadded::new(Futex::new(0)),
+            writers_futex: CachePadded::new(Futex::new(0)),
         }
     }
 }
@@ -71,6 +71,23 @@ pub(crate) struct RawMutex {
     ptr: *const InnerMutex,
 }
 
+/// Owns one acquisition, including while unwinding user code.
+pub(crate) struct RawGuard<'a> {
+    lock: &'a RawMutex,
+    exclusive: bool,
+}
+
+impl Drop for RawGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.exclusive {
+            self.lock.unlock_exclusive();
+        } else {
+            self.lock.unlock_shared();
+        }
+    }
+}
+
 // The sync can be safely sent across threads and shared concurrently
 unsafe impl Send for RawMutex {}
 unsafe impl Sync for RawMutex {}
@@ -79,6 +96,35 @@ impl std::panic::UnwindSafe for RawMutex {}
 impl std::panic::RefUnwindSafe for RawMutex {}
 
 impl RawMutex {
+    #[inline]
+    pub(crate) fn shared_guard(&self) -> RawGuard<'_> {
+        self.lock_shared();
+        RawGuard {
+            lock: self,
+            exclusive: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn exclusive_guard(&self) -> RawGuard<'_> {
+        self.lock_exclusive();
+        RawGuard {
+            lock: self,
+            exclusive: true,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_exclusive_guard(&self) -> Option<RawGuard<'_>> {
+        if self.try_lock_exclusive() {
+            Some(RawGuard {
+                lock: self,
+                exclusive: true,
+            })
+        } else {
+            None
+        }
+    }
     /// Creates a new `Mutex` instance (initial ref_count = 1)
     pub(crate) fn new() -> Self {
         let ptr = Box::into_raw(Box::new(InnerMutex::new()));
@@ -212,14 +258,24 @@ impl RawMutex {
     #[inline]
     fn unlock_exclusive_slow(&self) {
         let inner = self.inner();
-        let state = inner.state.load(Ordering::Relaxed);
-        let parked = state & (READERS_PARKED | WRITERS_PARKED);
-        let next_state = if parked & WRITERS_PARKED != 0 {
-            parked
-        } else {
-            UNLOCKED
+        let mut state = inner.state.load(Ordering::Relaxed);
+        let parked = loop {
+            let parked = state & (READERS_PARKED | WRITERS_PARKED);
+            let next_state = if parked & WRITERS_PARKED != 0 {
+                parked
+            } else {
+                UNLOCKED
+            };
+            match inner.state.compare_exchange_weak(
+                state,
+                next_state,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break parked,
+                Err(current) => state = current,
+            }
         };
-        let parked = inner.state.swap(next_state, Ordering::Release);
 
         if parked & WRITERS_PARKED != 0 {
             // The parked-writer bit is boolean, not a waiter count.
@@ -421,6 +477,7 @@ impl RawMutex {
             ) {
                 Ok(_) => {
                     if state & READERS_PARKED != 0 {
+                        inner.readers_futex.fetch_add(1, Ordering::Release);
                         futex_wake_all(&*inner.readers_futex);
                     }
                     break;
@@ -434,7 +491,7 @@ impl RawMutex {
 // Clone increases the internal reference count
 impl Clone for RawMutex {
     fn clone(&self) -> Self {
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::increment_ref_count(&self.inner().ref_count);
         RawMutex { ptr: self.ptr }
     }
 }

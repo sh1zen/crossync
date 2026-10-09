@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-10-09
+
+### Fixed
+
+- Thread-safety bounds for containers, guards and hash builders.
+- AtomicVec block lifetimes, reclamation, bulk operations and partial consumption.
+- AtomicBuffer reservations, ownership, draining and ring generations, including capacity one.
+- Panic cleanup, array allocation checks and collection from imprecise iterators.
+- Guard progress during array reset and map clear; value destruction outside locks.
+- Futex waiter state, Linux arguments, wake-all counts and dedicated 32-bit words.
+- SpinCell reader progress and Barrier arrival counts independent of clone count.
+
+### API
+
+- Atomic containers support `T: Send`, including `Cell` and `RefCell`, with serialized access.
+- Nested reads are supported; conflicting mutable reentrance panics.
+- Read guards transfer for `T: Sync`; exclusive guards transfer for `T: Send`.
+- `AtomicHashMap::hasher()` returns a `Deref` guard; `hasher_ref()` requires `S: Sync`.
+- `AtomicBuffer::push_box/pop_box` provide safe ownership transfer; raw `push` and SpinCell unlock methods are unsafe.
+- `Atomic::replace_with` preserves the initialized value on callback panic.
+- `Barrier::count` reports outstanding arrivals; zero initial capacity disables waiting.
+
+### Performance and verification
+
+- Inline per-slot locks and single-value atomic benchmarks.
+- Regression tests for ownership, panic cleanup, reentrance and guard transfer.
+- Documentation of access rules, ownership and verification commands.
+
 ## [0.1.2] - 2026-04-21
 
 - improved performances

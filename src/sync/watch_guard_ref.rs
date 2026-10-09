@@ -1,3 +1,5 @@
+use super::guard_lock::GuardLock;
+use crate::core::serial::SerialMutex;
 use crate::sync::RawMutex;
 use std::any::{Any, TypeId};
 use std::fmt::{Debug, Formatter};
@@ -9,25 +11,43 @@ use std::ops::Deref;
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct WatchGuardRef<'a, T: ?Sized> {
     data: *const T,
-    lock: *const RawMutex,
+    lock: GuardLock,
+    protection: *const RawMutex,
     marker: PhantomData<&'a T>,
 }
 
 unsafe impl<T: ?Sized + Sync> Sync for WatchGuardRef<'_, T> {}
-unsafe impl<T: ?Sized + Send> Send for WatchGuardRef<'_, T> {}
+unsafe impl<T: ?Sized + Sync> Send for WatchGuardRef<'_, T> {}
 
 impl<'mutex, T: ?Sized> WatchGuardRef<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
     pub(crate) fn new(ptr: &'mutex T, lock: *const RawMutex) -> WatchGuardRef<'mutex, T> {
         Self {
             data: ptr,
-            lock,
+            lock: GuardLock::shared(lock),
+            protection: std::ptr::null(),
             marker: PhantomData,
         }
     }
 
+    #[inline]
+    pub(crate) fn serial(ptr: &'mutex T, lock: *const SerialMutex, owner: u32) -> Self {
+        Self {
+            data: ptr,
+            lock: GuardLock::serial_read(lock, owner),
+            protection: std::ptr::null(),
+            marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn protect(mut self, lock: *const RawMutex) -> Self {
+        self.protection = lock;
+        self
+    }
+
     pub fn is_locked(&self) -> bool {
-        unsafe { (*self.lock).is_locked() }
+        unsafe { self.lock.is_locked() }
     }
 }
 
@@ -77,7 +97,12 @@ impl<'mutex, T: Sized> WatchGuardRef<'mutex, T> {
             // Safe only because we just checked that the type IDs match.
             let data = unsafe { &*(data as *const dyn Any as *const U) };
 
-            Ok(WatchGuardRef::new(data, this.lock))
+            Ok(WatchGuardRef {
+                data,
+                lock: this.lock,
+                protection: this.protection,
+                marker: PhantomData,
+            })
         } else {
             Err(ManuallyDrop::into_inner(this))
         }
@@ -88,9 +113,7 @@ impl<T: ?Sized> Deref for WatchGuardRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        debug_assert!(unsafe { (*self.lock).is_locked_shared() }, "{:?}", unsafe {
-            &*self.lock
-        });
+        debug_assert!(unsafe { self.lock.is_locked() });
         unsafe { &*self.data }
     }
 }
@@ -98,7 +121,14 @@ impl<T: ?Sized> Deref for WatchGuardRef<'_, T> {
 impl<T: ?Sized> Drop for WatchGuardRef<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        unsafe { (*self.lock).unlock_shared() };
+        unsafe {
+            self.lock.unlock();
+            // Array storage may be exchanged only after the slot unlock,
+            // including its final futex wake, has completely finished.
+            if !self.protection.is_null() {
+                (*self.protection).unlock_shared();
+            }
+        }
     }
 }
 
@@ -115,7 +145,7 @@ impl<'a, T: Debug> Debug for WatchGuardRef<'a, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WatchGuardRef")
             .field("data", &self.data)
-            .field("lock", &unsafe { &*self.lock })
+            .field("lock", &self.lock)
             .finish()
     }
 }

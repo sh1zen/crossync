@@ -1,5 +1,6 @@
+use crate::core::serial::SerialMutex;
 use crate::sync::RwLock;
-use crate::sync::{RawMutex, WatchGuardMut, WatchGuardRef};
+use crate::sync::{WatchGuardMut, WatchGuardRef};
 use crossbeam_utils::CachePadded;
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
@@ -35,14 +36,14 @@ impl<K, V> Entry<K, V> {
 /// A slot in the bucket array
 struct Slot<K, V> {
     head: AtomicPtr<Entry<K, V>>,
-    mutex: RawMutex,
+    mutex: SerialMutex,
 }
 
 impl<K, V> Slot<K, V> {
     fn new() -> Self {
         Self {
             head: AtomicPtr::new(null_mut()),
-            mutex: RawMutex::new(),
+            mutex: SerialMutex::new(),
         }
     }
 }
@@ -81,7 +82,7 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         // acquire shard read-phase to allow many concurrent ops on different shards
 
         let slot = self.get_slot(hash);
-        slot.mutex.lock_exclusive();
+        let _slot_guard = slot.mutex.write_guard();
 
         let mut cur = slot.head.load(Ordering::Acquire);
         while !cur.is_null() {
@@ -90,7 +91,7 @@ impl<K: Eq + Hash, V> Shard<K, V> {
                     // replace existing value
                     let old_value = ManuallyDrop::into_inner(std::ptr::read(&(*cur).value));
                     (*cur).value = ManuallyDrop::new(value);
-                    slot.mutex.unlock_exclusive();
+
                     return Some(old_value);
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
@@ -107,7 +108,6 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         slot.head.store(new_entry, Ordering::Release);
         self.count.fetch_add(1, Ordering::Relaxed);
 
-        slot.mutex.unlock_exclusive();
         None
     }
 
@@ -117,7 +117,7 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         Q: Hash + Eq,
     {
         let slot = self.get_slot(hash);
-        slot.mutex.lock_exclusive();
+        let _slot_guard = slot.mutex.write_guard();
 
         let mut cur = slot.head.load(Ordering::Acquire);
         let mut prev: *mut Entry<K, V> = null_mut();
@@ -133,10 +133,16 @@ impl<K: Eq + Hash, V> Shard<K, V> {
                     }
 
                     let value = ManuallyDrop::into_inner(std::ptr::read(&(*cur).value));
-                    drop(Box::from_raw(cur));
                     self.count.fetch_sub(1, Ordering::Relaxed);
+                    let entry = Box::from_raw(cur);
+                    let Entry {
+                        key,
+                        value: _,
+                        hash: _,
+                        next: _,
+                    } = *entry;
+                    drop(key);
 
-                    slot.mutex.unlock_exclusive();
                     return Some(value);
                 }
                 prev = cur;
@@ -144,7 +150,6 @@ impl<K: Eq + Hash, V> Shard<K, V> {
             }
         }
 
-        slot.mutex.unlock_exclusive();
         None
     }
 
@@ -154,43 +159,51 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         Q: Hash + Eq,
     {
         let slot = self.get_slot(hash);
-        slot.mutex.lock_shared();
+        let _slot_guard = slot.mutex.read_guard();
 
         let mut cur = slot.head.load(Ordering::Acquire);
         while !cur.is_null() {
             unsafe {
                 if (*cur).hash == hash && (*cur).key.borrow() == key {
-                    slot.mutex.unlock_shared();
                     return true;
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
             }
         }
 
-        slot.mutex.unlock_shared();
         false
     }
 
-    fn clear(&self) {
-        // exclusive over the shard because we will mutate every slot
-        for slot_p in &self.slots {
-            // slot_p: &CachePadded<Slot<K,V>>
-            let slot: &Slot<K, V> = &*slot_p;
-            slot.mutex.lock_exclusive();
-            let mut cur = slot.head.load(Ordering::Acquire);
-            while !cur.is_null() {
-                unsafe {
-                    let next = (*cur).next.load(Ordering::Acquire);
-                    ManuallyDrop::drop(&mut (*cur).value);
-                    drop(Box::from_raw(cur));
-                    cur = next;
+    fn try_detach(&self) -> Option<Vec<DetachedChain<K, V>>> {
+        let mut guards = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            match slot.mutex.try_write_guard() {
+                Some(guard) => guards.push(guard),
+                None => {
+                    assert!(
+                        !slot.mutex.owned_by_current_thread(),
+                        "clear while holding an AtomicHashMap guard"
+                    );
+                    return None;
                 }
             }
-            slot.head.store(null_mut(), Ordering::Release);
-            slot.mutex.unlock_exclusive();
         }
-
-        self.count.store(0, Ordering::Release);
+        // Hold every bucket before detaching anything, preserving the shard's
+        // clear semantics. Failed attempts release all locks before waiting.
+        let mut chains = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            // Publish removal before any destructor can unwind.
+            let chain = DetachedChain(slot.head.swap(null_mut(), Ordering::AcqRel));
+            let mut cur = chain.0;
+            let mut count = 0;
+            while !cur.is_null() {
+                count += 1;
+                cur = unsafe { (*cur).next.load(Ordering::Relaxed) };
+            }
+            self.count.fetch_sub(count, Ordering::Relaxed);
+            chains.push(chain);
+        }
+        Some(chains)
     }
 }
 
@@ -201,20 +214,34 @@ impl<K, V> Shard<K, V> {
     }
 }
 
-impl<K, V> Drop for Shard<K, V> {
+struct DetachedChain<K, V>(*mut Entry<K, V>);
+impl<K, V> Drop for DetachedChain<K, V> {
     fn drop(&mut self) {
-        for slot_p in &self.slots {
-            let slot: &Slot<K, V> = &*slot_p;
-            let mut cur = slot.head.load(Ordering::Acquire);
-            while !cur.is_null() {
-                unsafe {
-                    let next = (*cur).next.load(Ordering::Acquire);
-                    ManuallyDrop::drop(&mut (*cur).value);
-                    drop(Box::from_raw(cur));
-                    cur = next;
-                }
+        while !self.0.is_null() {
+            unsafe {
+                let entry = self.0;
+                self.0 = (*entry).next.load(Ordering::Relaxed);
+                // The recursive cleanup owns the remainder if either destructor panics.
+                let remainder = DetachedChain(self.0);
+                self.0 = null_mut();
+                let mut boxed = Box::from_raw(entry);
+                ManuallyDrop::drop(&mut boxed.value);
+                drop(boxed);
+                self.0 = remainder.0;
+                std::mem::forget(remainder);
             }
         }
+    }
+}
+impl<K, V> Drop for Shard<K, V> {
+    fn drop(&mut self) {
+        // Detach every bucket first: a panic must not leave a pointer to a freed node.
+        let chains: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| DetachedChain(slot.head.swap(null_mut(), Ordering::Relaxed)))
+            .collect();
+        drop(chains);
     }
 }
 
@@ -224,6 +251,9 @@ struct Inner<K, V, S> {
     /// Shards padded individually to avoid false sharing.
     shards: Box<[RwLock<Shard<K, V>>]>,
     hasher: S,
+    hasher_lock: SerialMutex,
+    // Set only during unique construction with a statically proven Sync S.
+    hasher_parallel: bool,
     /// ref_count padded to avoid false sharing with other atomics.
     ref_count: CachePadded<AtomicUsize>,
 }
@@ -234,23 +264,27 @@ pub struct AtomicHashMap<K, V, S = RandomState> {
     inner: *const Inner<K, V, S>,
 }
 
-unsafe impl<K: Send, V: Send, S> Send for AtomicHashMap<K, V, S> {}
-unsafe impl<K: Send, V: Send, S> Sync for AtomicHashMap<K, V, S> {}
+// Bucket read groups serialize all access to keys and values between threads.
+// Builders are serialized too, unless construction proved S: Sync. Returned
+// read guards can cross threads only when their V (or S) is Sync.
+unsafe impl<K: Send, V: Send, S: Send> Send for AtomicHashMap<K, V, S> {}
+unsafe impl<K: Send, V: Send, S: Send> Sync for AtomicHashMap<K, V, S> {}
 
 impl<K, V, S> UnwindSafe for AtomicHashMap<K, V, S> {}
 impl<K, V, S> RefUnwindSafe for AtomicHashMap<K, V, S> {}
 
 impl<K: Eq + Hash, V> AtomicHashMap<K, V, RandomState> {
     pub fn new() -> Self {
-        Self::with_capacity_and_hasher(0, RandomState::default())
+        Self::with_capacity_and_hasher(0, RandomState::default()).parallel_builder()
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_and_hasher(capacity, RandomState::default())
+        Self::with_capacity_and_hasher(capacity, RandomState::default()).parallel_builder()
     }
 
     pub fn with_shard_amount(shard_amount: usize) -> Self {
         Self::with_capacity_hasher_and_shard_amount(0, RandomState::default(), shard_amount)
+            .parallel_builder()
     }
 }
 
@@ -277,7 +311,10 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
         let shift = std::mem::size_of::<usize>() * 8 - shard_amount.trailing_zeros() as usize;
 
         if capacity != 0 {
-            capacity = (capacity + (shard_amount - 1)) & !(shard_amount - 1);
+            capacity = capacity
+                .checked_add(shard_amount - 1)
+                .expect("map capacity overflow")
+                & !(shard_amount - 1);
         }
 
         let capacity_per_shard = if capacity == 0 {
@@ -295,6 +332,8 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
             shift,
             shards,
             hasher,
+            hasher_lock: SerialMutex::new(),
+            hasher_parallel: false,
             ref_count: CachePadded::new(AtomicUsize::new(1)),
         });
 
@@ -305,7 +344,13 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
 
     #[inline]
     fn hash<Q: ?Sized + Hash>(&self, key: &Q) -> u64 {
-        let mut hasher = self.inner().hasher.build_hasher();
+        let inner = self.inner();
+        let mut hasher = if inner.hasher_parallel {
+            inner.hasher.build_hasher()
+        } else {
+            let _guard = inner.hasher_lock.read_guard();
+            inner.hasher.build_hasher()
+        };
         key.hash(&mut hasher);
         hasher.finish()
     }
@@ -333,20 +378,21 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
         let shard = self.inner().shards[idx].lock_shared();
         let slot = shard.get_slot(hash);
 
-        slot.mutex.lock_shared();
+        let slot_guard = slot.mutex.read_guard();
 
         let mut cur = slot.head.load(Ordering::Acquire);
         while !cur.is_null() {
             unsafe {
                 if (*cur).hash == hash && (*cur).key.borrow() == key {
                     // Pass a raw pointer to the mutex, not a clone
-                    return Some(WatchGuardRef::new(&(*cur).value, &slot.mutex));
+                    let owner = slot_guard.owner_token();
+                    std::mem::forget(slot_guard);
+                    return Some(WatchGuardRef::serial(&(*cur).value, &slot.mutex, owner));
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
             }
         }
 
-        slot.mutex.unlock_shared();
         None
     }
 
@@ -367,19 +413,19 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
         let idx = self.determine_shard(hash);
         let shard = self.inner().shards[idx].lock_shared();
         let slot = shard.get_slot(hash);
-        slot.mutex.lock_exclusive();
+        let slot_guard = slot.mutex.write_guard();
 
         let mut cur = slot.head.load(Ordering::Acquire);
         while !cur.is_null() {
             unsafe {
                 if (*cur).hash == hash && (*cur).key.borrow() == key {
-                    return Some(WatchGuardMut::new(&mut *(*cur).value, &slot.mutex));
+                    std::mem::forget(slot_guard);
+                    return Some(WatchGuardMut::serial(&mut *(*cur).value, &slot.mutex));
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
             }
         }
 
-        slot.mutex.unlock_exclusive();
         None
     }
 
@@ -415,13 +461,44 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
 
     pub fn clear(&self) {
         for shard_p in self.inner().shards.iter() {
-            let shard = shard_p.lock_exclusive();
-            shard.clear();
+            let backoff = crate::sync::Backoff::new();
+            let chains = loop {
+                if let Some(shard) = shard_p.try_lock() {
+                    if let Some(chains) = shard.try_detach() {
+                        break chains;
+                    }
+                } else {
+                    // A callback may still hold the shard's shared phase.
+                    // Detect its own bucket guard without closing reader gates.
+                    let shard = shard_p.lock_shared();
+                    assert!(
+                        shard
+                            .slots
+                            .iter()
+                            .all(|slot| !slot.mutex.owned_by_current_thread()),
+                        "reentrant AtomicHashMap clear"
+                    );
+                }
+                backoff.snooze();
+            };
+            // Detached values are destroyed after releasing every lock.
+            drop(chains);
         }
     }
 
     #[inline]
-    pub fn hasher(&self) -> &S {
+    /// Borrows the builder under a guard, including builders that are !Sync.
+    pub fn hasher(&self) -> WatchGuardRef<'_, S> {
+        let inner = self.inner();
+        let owner = inner.hasher_lock.lock_read();
+        WatchGuardRef::serial(&inner.hasher, &inner.hasher_lock, owner)
+    }
+
+    /// Borrows a Sync builder without a guard, for APIs requiring an explicit &S.
+    pub fn hasher_ref(&self) -> &S
+    where
+        S: Sync,
+    {
         &self.inner().hasher
     }
 
@@ -437,7 +514,7 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
 
             for slot_p in &shard.slots {
                 let slot: &Slot<K, V> = &*slot_p;
-                slot.mutex.lock_shared();
+                let _slot_guard = slot.mutex.read_guard();
 
                 let mut cur = slot.head.load(Ordering::Acquire);
                 while !cur.is_null() {
@@ -447,8 +524,6 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
                         cur = entry.next.load(Ordering::Acquire);
                     }
                 }
-
-                slot.mutex.unlock_shared();
             }
         }
 
@@ -458,6 +533,17 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
 
 // Methods without generic constraints
 impl<K, V, S> AtomicHashMap<K, V, S> {
+    fn parallel_builder(self) -> Self
+    where
+        S: Sync,
+    {
+        assert_eq!(self.inner().ref_count.load(Ordering::Relaxed), 1);
+        // Only constructors call this, before publishing any handle or guard.
+        unsafe {
+            (*self.inner.cast_mut()).hasher_parallel = true;
+        }
+        self
+    }
     #[inline]
     fn inner(&self) -> &Inner<K, V, S> {
         unsafe { &*self.inner }
@@ -488,7 +574,7 @@ impl<K, V, S> AtomicHashMap<K, V, S> {
 
 impl<K, V, S> Clone for AtomicHashMap<K, V, S> {
     fn clone(&self) -> Self {
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::increment_ref_count(&self.inner().ref_count);
         Self { inner: self.inner }
     }
 }

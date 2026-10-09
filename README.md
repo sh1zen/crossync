@@ -1,28 +1,39 @@
-# 📦 Blazingly Fast Concurrent Data Structures
+# Blazingly Fast Concurrent Data Structures
 
-- 🪪 Thread-safe with spin-lock backoff and kernel-level mutexes
-- ⚡ Optimized for high-concurrency workloads
-- 💾 Optimized cloning with safe memory management via internal reference counting 
-- 🔐 Internal mutability
+`crossync` provides concurrent data structures and synchronization primitives for Rust.
+It combines atomic operations, backoff strategies, and internal locks to support shared access in multithreaded applications.
+
+- Concurrent collections for shared state, queues, and message passing
+- Interior mutability with synchronized access
+- Reference-counted handles for sharing supported containers without copying their contents
+
+## Installation
+
+Add `crossync` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+crossync = "0.2.0"
+```
 
 ---
 
-## ✨ AtomicVec
+## AtomicVec
 
-**AtomicVec<T>** is a high-performance, thread-safe vector supporting concurrent push and pop operations with minimal locking overhead.
-It uses block-based allocation, atomic indices, and internal backoff strategies to manage memory efficiently in multi-threaded contexts.
+`AtomicVec<T>` is a thread-safe collection supporting concurrent push and pop operations.
+It uses block-based allocation, atomic indices, and backoff strategies to manage storage and contention.
 
-- 🧠 Suitable for implementing queues, stacks, and other dynamic collections
-- 🛡️ Shared/exclusive locking for safe access and reset operations
-- ♻️ Automatic block recycling and free-list management
-- 📦 Can convert to standard Vec<T> safely, consuming elements
+- Suitable for work queues and dynamic collections
+- Shared and exclusive locking for access and reset operations
+- Automatic block recycling and free-list management
+- Conversion to a standard `Vec<T>` by consuming elements
 
 ### Example
 
 ```rust
 use std::thread;
 use crossync::atomic::AtomicVec;
-    
+
 let h = AtomicVec::new();
 
 h.push("hello");
@@ -44,20 +55,20 @@ assert!(b.pop().is_none());
 
 ---
 
-## ✨ AtomicHashMap
+## AtomicHashMap
 
-**AtomicHashMap** a blazingly fast thread-safe, concurrent hash map that supports high-performance insertion, retrieval, and removal of key-value pairs.  
-It uses fine-grained atomic operations combined with internal mutexes to manage contention efficiently.
+`AtomicHashMap<K, V>` is a thread-safe hash map that supports concurrent insertion, retrieval, and removal of key-value pairs.
+It combines atomic operations with internal locks to coordinate access.
 
-- 🧠 Ideal for shared caches, state maps, and in high concurrency scenario
-- 📏 It uses resizable bucket array to optimize hash distribution and performance
+- Suitable for shared caches and application state
+- Resizable bucket storage for growing collections
 
 ### Example
 
 ```rust
 use std::thread;
 use crossync::atomic::AtomicHashMap;
-    
+
 let h = AtomicHashMap::new();
 
 h.insert("c", "hello");
@@ -68,7 +79,7 @@ drop(h);
     let b = b.clone();
     let t = thread::spawn(move || {
         if let Some(mut v) = b.get_mut("c") {
-            *v = "world"
+            *v = "world";
         }
     });
     t.join().unwrap();
@@ -79,12 +90,13 @@ assert_eq!(b.get("c").unwrap(), "world");
 
 ---
 
-## ✨ AtomicBuffer
+## AtomicBuffer
 
-**AtomicBuffer** is a lock-free, bounded, and thread-safe ring buffer.  
-It provides atomic push and pop operations without requiring locks, making it ideal for high-performance concurrent producer/consumer systems.
+`AtomicBuffer<T>` is a bounded, thread-safe ring buffer with per-slot sequence numbers.
+It uses atomic push and pop operations for concurrent producers and consumers. A stalled reservation can delay other operations.
 
-- 🧠 Suitable for work queues, message passing, or object pooling systems
+- Suitable for work queues, message passing, and object pools
+- `push_box` and `pop_box` transfer ownership safely; raw `push` is unsafe and requires a uniquely owned, non-null `Box` allocation
 
 ### Example
 
@@ -97,8 +109,8 @@ let buffer = AtomicBuffer::with_capacity(2);
 let producer = {
     let buffer = buffer.clone();
     thread::spawn(move || {
-        let _ = buffer.push(Box::into_raw(Box::new(1)));
-        let _ = buffer.push(Box::into_raw(Box::new(2)));
+        buffer.push_box(Box::new(1)).unwrap();
+        buffer.push_box(Box::new(2)).unwrap();
     })
 };
 
@@ -107,9 +119,8 @@ let consumer = {
     thread::spawn(move || {
         let mut count = 1;
         while count <= 2 {
-            if let Some(ptr) = buffer.pop() {
-                let val = unsafe { *Box::from_raw(ptr) };
-                assert_eq!(val, count);
+            if let Some(value) = buffer.pop_box() {
+                assert_eq!(*value, count);
                 count += 1;
             }
         }
@@ -122,12 +133,12 @@ consumer.join().unwrap();
 
 ---
 
-## ✨ AtomicCell
+## AtomicCell
 
-**AtomicCell** is a thread-safe, lock-assisted atomic container that provides interior mutability with cloneable reference counting.  
-It combines mutex-protected access, raw memory management, and atomic reference counting to safely store and manipulate a single value in concurrent environments.
+`AtomicCell<T>` is a thread-safe, lock-assisted container for a single value.
+It provides interior mutability through synchronized access and uses reference counting to share the value across cloned handles.
 
-- 🧠 Ideal for shared single-value state in multithreaded programs
+- Suitable for shared single-value state in multithreaded programs
 
 ### Example
 
@@ -150,12 +161,12 @@ assert_eq!(*c.get(), 11);
 
 ---
 
-## ✨ AtomicArray
+## AtomicArray
 
-**AtomicArray** is a lock-assisted, thread-safe array optimized for concurrent reads and writes.  
-It combines atomic indices, per-slot locks, and cache-friendly memory layout to provide efficient and safe access in multi-threaded environments.
+`AtomicArray<T>` is a lock-assisted, thread-safe array supporting concurrent reads and writes.
+It combines atomic indices and per-slot locks to coordinate access to stored values.
 
-- 🧠 Optimized for high-concurrency workloads with backoff spins
+- Backoff strategies manage contention during concurrent operations
 
 ### Example
 
@@ -181,16 +192,14 @@ assert_eq!(*arr.get(0).unwrap(), 20);
 
 ---
 
-## ✨ Atomic<T> — Universal Atomic Wrapper
+## Atomic
 
-**Atomic<T>** is a powerful generic atomic type providing thread-safe access to **any** Rust type `T`.  
-It supports complex types, structs, enums, collections, primitives, and user-defined data — all synchronized via an internal `SMutex`.
+`Atomic<T>` is a generic, lock-assisted container that provides synchronized access to a Rust value.
+It supports primitives, structs, enums, collections, and other user-defined types. Sharing an `Atomic` container between threads requires `T: Send`, including types such as `Cell` and `RefCell` that are `!Sync`. The container manages locking internally.
 
-- 🧠 Works with **any type**: primitives, structs, enums, strings, vectors, and custom types
-- 🔄 Provides **atomic load, store, swap, update, and compare-exchange** operations
-- 🧩 Specialized methods for common containers (`Vec<T>`, `String`, `Option<T>`)
-- 🧮 Supports numeric and bitwise atomic operations (`fetch_add`, `fetch_sub`, etc.)
-- 🔐 Thread-safe interior mutability with minimal overhead
+- Load, store, swap, update, and compare-exchange operations, subject to method-specific trait bounds
+- Specialized methods for `Vec<T>`, `String`, and `Option<T>`
+- Numeric and bitwise operations such as `fetch_add` and `fetch_sub`
 
 ### Example
 
@@ -227,14 +236,45 @@ assert_eq!(result.age, 31);
 
 ---
 
-## ✨ RwLock
+## Access and ownership
 
-**RwLock** is a lightweight, synchronization primitive for safe concurrent access. It provides multi-reader / single-writer locking with minimal kernel interaction.
+The following rules apply to the lock-assisted atomic containers:
 
- - ⚡ Fast atomic + futex-based design
- - 🔒 Shared (read) and exclusive (write) modes
- - 🧩 Clonable via internal ref-count (no data copy)
- - ✅ Compared to std::RwLock: user-space (faster, no poisoning, clonable).
+- `Atomic`, `AtomicCell`, `AtomicArray`, and `AtomicHashMap` serialize access to the same value or map bucket, including read callbacks and `get()` guards.
+- Nested reads on the acquiring thread are supported. Conflicting mutable reentrance and read-to-write upgrades panic before creating an alias.
+- Release guards before conflicting access or array reset; acquire distinct locks in a consistent order.
+- Read guards can transfer between threads when `T: Sync`; exclusive guards can transfer when `T: Send`. Reentrance checks use the acquiring-thread identity until the acquisition or read group is released.
+- `AtomicHashMap::hasher()` returns a `Deref<Target = S>` guard. Use `map.hasher().build_hasher()` for method calls, `&*map.hasher()` for `&S` arguments, or `map.hasher_ref()` when `S: Sync`. Default constructors allow parallel access to their `Sync` builder.
+
+See [CONCURRENCY.md](CONCURRENCY.md) for synchronization details and verification commands.
+
+### Sharing a value with interior mutability
+
+```rust
+use crossync::atomic::AtomicCell;
+use std::cell::Cell;
+use std::thread;
+
+let value = AtomicCell::new(Cell::new(0));
+thread::scope(|scope| {
+    for _ in 0..4 {
+        let value = &value;
+        scope.spawn(move || value.with(|cell| cell.set(cell.get() + 1)));
+    }
+});
+assert_eq!(value.get().get(), 4);
+```
+
+---
+
+## RwLock
+
+`RwLock<T>` is a synchronization primitive that supports multiple readers or a single writer.
+It uses atomic operations and platform-specific waiting mechanisms to coordinate access.
+
+- Shared (read) and exclusive (write) locking modes
+- Reference-counted cloning without copying the stored value
+- No lock poisoning
 
 ### Example
 
@@ -249,14 +289,14 @@ let mutex = RwLock::new(5);
 let m1 = mutex.clone();
 
 let h1 = thread::spawn(move || {
-let _guard = m1.lock_exclusive();
-sleep(Duration::from_millis(10));
+    let _guard = m1.lock_exclusive();
+    sleep(Duration::from_millis(10));
 });
 
 let m2 = mutex.clone();
 let h2 = thread::spawn(move || {
-let _guard = m2.lock_shared();
-sleep(Duration::from_millis(10));
+    let _guard = m2.lock_shared();
+    sleep(Duration::from_millis(10));
 });
 
 h1.join().unwrap();
@@ -265,13 +305,13 @@ h2.join().unwrap();
 
 ---
 
-## ✨ Barrier — Thread Synchronization Primitive
+## Barrier
 
-**Barrier** is a lightweight, thread-safe synchronization primitive that coordinates groups of threads.  
-It blocks threads until a specified number of waiters arrive, then releases them all simultaneously.  
-Once released, the barrier resets to a configurable capacity for reuse.
+`Barrier` coordinates groups of threads by blocking waiters until the required number of arrivals is reached.
+`Barrier::with_capacity(n, bucket)` requires `n` arrivals for the first phase and `bucket` arrivals for subsequent phases.
+A zero `bucket` disables the barrier after the first phase; a zero `n` creates an already-disabled barrier.
 
-- 🧠 Suitable for parallel algorithms, phased execution, and workload synchronization
+- Suitable for parallel algorithms, phased execution, and workload synchronization
 
 ### Example
 
@@ -298,18 +338,6 @@ for h in handles {
 
 ---
 
-## 📦 Installation
+## License
 
-Install `crossync` from crates.io  
-Open your `Cargo.toml` and add:
-
-```toml
-[dependencies]
-crossync = "0.0.4" # or the latest version available
-```
-
----
-
-## 📄 License
-
-Apache-2.0
+Licensed under the [Apache License 2.0](LICENSE).
