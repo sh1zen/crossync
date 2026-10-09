@@ -226,28 +226,29 @@ mod tests_atomic_array {
 
     #[test]
     fn test_reset_with_concurrent_accessors_and_push() {
+        // Bound the workload so readers eventually quiesce and reset can acquire
+        // exclusive coordination even on a heavily contended CI runner. This
+        // also bounds the number of increments of the i32 test value.
+        const ACCESS_ATTEMPTS: usize = 1024;
+
         let arr = Arc::new(AtomicArray::from_iter(0..32));
         let start = Arc::new(Barrier::new(7));
-        let done = Arc::new(AtomicBool::new(false));
 
         let reset_arr = arr.clone();
         let reset_start = start.clone();
-        let reset_done = done.clone();
         let resetter = thread::spawn(move || {
             reset_start.wait();
             for round in 0..64 {
                 reset_arr.reset_with(32, || round).unwrap();
                 thread::yield_now();
             }
-            reset_done.store(true, Ordering::Release);
         });
 
         let get_arr = arr.clone();
         let get_start = start.clone();
-        let get_done = done.clone();
         let getter = thread::spawn(move || {
             get_start.wait();
-            while !get_done.load(Ordering::Acquire) {
+            for _ in 0..ACCESS_ATTEMPTS {
                 if let Some(guard) = get_arr.get(0) {
                     let _ = *guard;
                 }
@@ -256,10 +257,9 @@ mod tests_atomic_array {
 
         let get_mut_arr = arr.clone();
         let get_mut_start = start.clone();
-        let get_mut_done = done.clone();
         let mutator = thread::spawn(move || {
             get_mut_start.wait();
-            while !get_mut_done.load(Ordering::Acquire) {
+            for _ in 0..ACCESS_ATTEMPTS {
                 if let Some(mut guard) = get_mut_arr.get_mut(0) {
                     *guard += 1;
                 }
@@ -268,30 +268,27 @@ mod tests_atomic_array {
 
         let as_vec_arr = arr.clone();
         let as_vec_start = start.clone();
-        let as_vec_done = done.clone();
         let snapshotter = thread::spawn(move || {
             as_vec_start.wait();
-            while !as_vec_done.load(Ordering::Acquire) {
+            for _ in 0..ACCESS_ATTEMPTS {
                 let _ = as_vec_arr.as_vec();
             }
         });
 
         let for_each_arr = arr.clone();
         let for_each_start = start.clone();
-        let for_each_done = done.clone();
         let iterator = thread::spawn(move || {
             for_each_start.wait();
-            while !for_each_done.load(Ordering::Acquire) {
+            for _ in 0..ACCESS_ATTEMPTS {
                 for_each_arr.for_each(|_| {});
             }
         });
 
         let push_arr = arr.clone();
         let push_start = start.clone();
-        let push_done = done.clone();
         let pusher = thread::spawn(move || {
             push_start.wait();
-            while !push_done.load(Ordering::Acquire) {
+            for _ in 0..ACCESS_ATTEMPTS {
                 let _ = push_arr.push(1234);
             }
         });

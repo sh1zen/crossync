@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-10-09
+
+### Fixed
+
+- Bounded concurrent AtomicArray reset test workloads to prevent integer overflow and prolonged contention in CI.
+- Explicit stable Rust setup, dependency caching, timeouts and diagnostics in GitHub Actions.
+- Documentation redirect to the crossync crate and scoped Pages permissions.
+- Clean source release archives and explicit tag selection for manual releases.
+- Deployment cleanup pagination and inactive status before deletion.
+
 ## [0.2.0] - 2026-10-09
 
 ### Fixed

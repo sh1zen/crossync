@@ -1,18 +1,28 @@
 name: Delete Deployments
+
 on: workflow_dispatch
 
 permissions:
-  contents: write
   deployments: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   cleanup:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Delete all deployments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for id in $(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            https://api.github.com/repos/${{ github.repository }}/deployments | jq '.[].id'); do
-            curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              https://api.github.com/repos/${{ github.repository }}/deployments/$id
+          # Collect all IDs before deletion so pagination is not affected by removals.
+          deployment_ids=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/deployments?per_page=100" --jq '.[].id')
+          for id in $deployment_ids; do
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/deployments/${id}/statuses" \
+              -f state=inactive -F auto_inactive=false
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/deployments/${id}"
           done

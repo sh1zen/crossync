@@ -13,7 +13,7 @@ Add `crossync` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-crossync = "0.2.0"
+crossync = "0.2.1"
 ```
 
 ---
